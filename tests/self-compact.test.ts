@@ -293,3 +293,18 @@ test('a run that stops at the warning line is asked to hand off, at most twice p
   assert.equal(requests().length, 3, 'a new context epoch re-arms the requests');
   await h.emit('session_shutdown');
 });
+
+test('the returned note renders as one summary line and shows in full only when expanded', async t => {
+  const cwd = await mkdtemp(join(tmpdir(), 'pi-self-compact-render-'));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const h = host(cwd);
+  const renderers = new Map<string, any>();
+  (h.pi as any).registerMessageRenderer = (type: string, renderer: unknown) => { renderers.set(type, renderer); };
+  installSelfCompact(h.pi);
+  const theme = { fg: (_tone: string, text: string) => text, bold: (text: string) => text };
+  const message = { content: 'GOAL\nNEXT ACTION: go', details: { cycle: 1, note: 'GOAL\nNEXT ACTION: go', tokensBefore: 200_833 } };
+  const render = (expanded: boolean) => renderers.get(HANDOFF_TYPE)(message, { expanded, outputPad: 0 }, theme).render(200).join('\n');
+  assert.match(render(false), /compacted from 200,833 tokens · cycle 1 · note returned to the agent \(20 chars\)/);
+  assert.doesNotMatch(render(false), /NEXT ACTION/);
+  assert.match(render(true), /NEXT ACTION: go/);
+});

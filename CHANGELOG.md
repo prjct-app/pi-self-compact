@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.1
+
+- The returned note renders as one line (`✓ self-compact · compacted from 200,833 tokens · cycle 1 · note returned to the agent`); expand it to read the note.
+
 ## 0.2.0
 
 - Hand off automatically: an idle run at or past the warning line, including a session resumed there, is asked to write its note and compact (at most twice per cycle).

@@ -93,6 +93,8 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
     inFlight: false,
     lastError: undefined as string | undefined,
     autoRequests: 0,
+    /** Context size the last compaction started from, for the one-line handoff summary. */
+    tokensBefore: undefined as number | undefined,
     alive: true,
     timers: new Map<string, ReturnType<typeof setTimeout>>(),
     promptErrors: new Set<string>(),
@@ -219,7 +221,7 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
     }
     // The content is exactly the saved note; the header lives in the renderer.
     pi.sendMessage({ customType: HANDOFF_TYPE, content: handoff.note, display: true,
-      details: { id: handoff.id, cycle: R.state.cycle, note: handoff.note } }, { triggerTurn: true });
+      details: { id: handoff.id, cycle: R.state.cycle, note: handoff.note, tokensBefore: R.tokensBefore } }, { triggerTurn: true });
   };
 
   const startCompaction = (ctx: ExtensionContext, trigger: string): void => {
@@ -352,13 +354,14 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
     },
   });
 
+  // One summary line; expanding it shows the note exactly as the agent received it.
   pi.registerMessageRenderer(HANDOFF_TYPE, (message, options, theme) => {
-    const details = message.details as { cycle?: number; note?: string; resumed?: boolean } | undefined;
+    const details = message.details as { cycle?: number; note?: string; resumed?: boolean; tokensBefore?: number } | undefined;
     const note = details?.note ?? (typeof message.content === 'string' ? message.content : '');
-    // Always shown in full: this is exactly what the agent receives after compaction.
-    const header = theme.fg('success', theme.bold('self-compact · handoff'))
-      + theme.fg('dim', ` cycle ${details?.cycle ?? '?'} · note_to_self returned verbatim (${note.length.toLocaleString('en-US')} chars)`);
-    return new Text(`${header}\n${theme.fg('text', note)}`, options.outputPad ?? 1, 0);
+    const from = details?.tokensBefore ? ` from ${details.tokensBefore.toLocaleString('en-US')} tokens` : '';
+    const line = theme.fg('success', `${SYMBOL.ok} self-compact · compacted${from} · cycle ${details?.cycle ?? '?'}`)
+      + theme.fg('dim', details?.resumed ? ' · resuming from the saved note' : ` · note returned to the agent (${note.length.toLocaleString('en-US')} chars)`);
+    return new Text(options.expanded ? `${line}\n${theme.fg('text', note)}` : line, options.outputPad ?? 1, 0);
   });
 
   const toneOf = (level: Level): 'error' | 'warning' | 'accent' => level === 'forced' ? 'error' : level === 'warning' ? 'warning' : 'accent';
@@ -558,6 +561,7 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
     R.announced = 'idle';
     R.inFlight = false;
     R.autoRequests = 0;
+    R.tokensBefore = event.compactionEntry?.tokensBefore;
     const handoff = pending();
     if (handoff) {
       save({ cycle: R.state.cycle + 1, handoff: { ...handoff, status: 'ready', error: undefined }, locked: false });
