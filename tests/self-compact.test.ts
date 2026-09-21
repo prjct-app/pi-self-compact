@@ -258,3 +258,38 @@ test('/self-compact reports status, asks for a note on now, and rejects other wo
   await command.handler('bogus', h.ctx);
   assert.match(notices.at(-1) ?? '', /^Usage:/);
 });
+
+test('a session resumed past the cutoff hands off by itself, without a prompt', async t => {
+  const cwd = await mkdtemp(join(tmpdir(), 'pi-self-compact-resume-'));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const h = host(cwd);
+  h.gauge.tokens = 200_833;
+  installSelfCompact(h.pi);
+  await h.emit('session_start', { reason: 'resume' });
+  await new Promise(resolve => setTimeout(resolve, 600));
+  const request = h.sent.find(item => item.message.customType === 'self-compact-guidance');
+  assert.ok(request, 'the handoff is requested automatically');
+  assert.equal(request.options.triggerTurn, true);
+  assert.match(request.message.content, /^Compact now:/);
+  await h.emit('session_shutdown');
+});
+
+test('a run that stops at the warning line is asked to hand off, at most twice per cycle', async t => {
+  const cwd = await mkdtemp(join(tmpdir(), 'pi-self-compact-auto-'));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const h = host(cwd);
+  installSelfCompact(h.pi);
+  await h.emit('session_start', { reason: 'startup' });
+  h.gauge.tokens = 90_000;
+  await h.emit('agent_end');
+  const requests = () => h.sent.filter(item => item.message.customType === 'self-compact-guidance');
+  assert.equal(requests().length, 0, 'below the warning line nothing is requested');
+  h.gauge.tokens = 155_000;
+  for (const _ of [1, 2, 3]) await h.emit('agent_end');
+  assert.equal(requests().length, 2);
+  assert.deepEqual(requests()[0]?.options, { triggerTurn: true, deliverAs: 'followUp' });
+  await h.emit('session_compact', { reason: 'manual' });
+  await h.emit('agent_end');
+  assert.equal(requests().length, 3, 'a new context epoch re-arms the requests');
+  await h.emit('session_shutdown');
+});

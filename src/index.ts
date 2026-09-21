@@ -40,6 +40,8 @@ export const CONTEXT_USAGE_TOOL = 'context_usage';
 const STATUS_KEY = 'self-compact';
 const MAX_AUTO_RETRIES = 3;
 const SUMMARY_ATTEMPTS = 2;
+/** Unprompted handoff requests per context epoch, so an agent that ignores them cannot loop. */
+const MAX_AUTO_REQUESTS = 2;
 
 export type SelfCompactOptions = Readonly<{
   enabled?: boolean;
@@ -90,7 +92,7 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
     announced: 'idle' as Level,
     inFlight: false,
     lastError: undefined as string | undefined,
-    nudgedEpoch: -1,
+    autoRequests: 0,
     alive: true,
     timers: new Map<string, ReturnType<typeof setTimeout>>(),
     promptErrors: new Set<string>(),
@@ -230,6 +232,20 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
     ctx.compact({ onComplete: () => { R.inFlight = false; }, onError: () => { R.inFlight = false; } });
   };
 
+  /**
+   * At the warning line or past it, an idle agent is asked to hand off on its
+   * own: the person never has to type anything for the run to compact.
+   */
+  const requestHandoff = (ctx: ExtensionContext, followUp: boolean): void => {
+    if (!active() || pending() || R.autoRequests >= MAX_AUTO_REQUESTS) return;
+    const level: Level = R.state.locked ? 'forced' : R.level;
+    if ((level !== 'warning' && level !== 'forced') || !compactable(ctx)) return;
+    R.autoRequests += 1;
+    pi.sendMessage({ customType: GUIDANCE_TYPE, content: compactNowPrompt(), display: true,
+      details: { level, percent: R.usage.percent, auto: true } },
+    followUp ? { triggerTurn: true, deliverAs: 'followUp' } : { triggerTurn: true });
+  };
+
   const usageView = (ctx: ExtensionContext) => {
     refresh(ctx);
     const t = R.thresholds;
@@ -345,12 +361,24 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
     return new Text(`${header}\n${theme.fg('text', note)}`, options.outputPad ?? 1, 0);
   });
 
-  pi.registerEntryRenderer(PHASE_TYPE, (entry, _options, theme) => {
+  const toneOf = (level: Level): 'error' | 'warning' | 'accent' => level === 'forced' ? 'error' : level === 'warning' ? 'warning' : 'accent';
+  const phaseLine = (level: Level, percent: number | null | undefined): string => `self-compact · ${level === 'notice' ? 'notice' : levelTag(level)} at ${formatPct(percent)} · ${
+    level === 'forced' ? 'tools locked, compacting automatically' : level === 'warning' ? 'compacting at the next checkpoint' : 'heads-up only'}`;
+
+  // One line per crossing; expanded shows the exact guidance the model receives.
+  pi.registerEntryRenderer(PHASE_TYPE, (entry, options, theme) => {
     const data = entry.data as { level?: Level; percent?: number | null; text?: string } | undefined;
     const level = data?.level ?? 'notice';
-    const tone = level === 'forced' ? 'error' : level === 'warning' ? 'warning' : 'accent';
-    const text = data?.text?.trim() || `self-compact · ${levelTag(level).toLowerCase()} line crossed at ${formatPct(data?.percent)}`;
-    return new Text(theme.fg(tone, text), 0, 0);
+    const line = theme.fg(toneOf(level), phaseLine(level, data?.percent));
+    return new Text(options.expanded && data?.text ? `${line}\n${theme.fg('dim', data.text.trim())}` : line, 0, 0);
+  });
+
+  pi.registerMessageRenderer(GUIDANCE_TYPE, (message, options, theme) => {
+    const details = message.details as { level?: Level; percent?: number | null } | undefined;
+    const level = details?.level ?? 'warning';
+    const line = theme.fg(toneOf(level), `self-compact · ${levelTag(level)} at ${formatPct(details?.percent)} · asked the agent to write its note and compact`);
+    const content = typeof message.content === 'string' ? message.content : '';
+    return new Text(options.expanded ? `${line}\n${theme.fg('dim', content)}` : line, options.outputPad ?? 1, 0);
   });
 
   const recover = (reason: string, ctx: ExtensionContext): void => {
@@ -359,6 +387,7 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
     R.epoch += 1;
     R.announced = 'idle';
     R.inFlight = false;
+    R.autoRequests = 0;
     R.promptErrors.clear();
     loadSettings(ctx);
     resolve(ctx);
@@ -388,6 +417,8 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
       save({ locked: false });
     }
     track(ctx);
+    // A session resumed at or past the warning line hands off without waiting for a prompt.
+    if (!pending() && !recovered.unanswered) defer('auto', 500, () => { if (ctx.isIdle()) requestHandoff(ctx, false); });
   };
 
   pi.on('session_start', async (event, ctx) => recover(event.reason, ctx));
@@ -471,10 +502,8 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
 
   pi.on('agent_end', async (_event, ctx) => {
     track(ctx);
-    // Only the hard cutoff earns an unprompted turn; below it the next prompt carries the warning.
-    if (!active() || pending() || !R.state.locked || R.nudgedEpoch === R.epoch) return;
-    R.nudgedEpoch = R.epoch;
-    pi.sendMessage({ customType: GUIDANCE_TYPE, content: compactNowPrompt(), display: true }, { triggerTurn: true, deliverAs: 'followUp' });
+    // The run stopped at or past the warning line: a clean checkpoint, so hand off now.
+    requestHandoff(ctx, true);
   });
 
   pi.on('agent_settled', async (_event, ctx) => {
@@ -528,6 +557,7 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
     R.epoch += 1;
     R.announced = 'idle';
     R.inFlight = false;
+    R.autoRequests = 0;
     const handoff = pending();
     if (handoff) {
       save({ cycle: R.state.cycle + 1, handoff: { ...handoff, status: 'ready', error: undefined }, locked: false });
