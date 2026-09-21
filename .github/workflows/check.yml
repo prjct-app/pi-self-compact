@@ -1,0 +1,25 @@
+name: Check
+
+on:
+  pull_request:
+  push:
+    branches: [main, develop]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22.19.0
+          cache: npm
+      - run: git clone --depth 1 https://github.com/prjct-app/pi-tui-kit ../pi-tui-kit && npm ci --prefix ../pi-tui-kit --ignore-scripts && npm run build --prefix ../pi-tui-kit
+      - run: npm ci --ignore-scripts
+      - run: npm run check
+      - run: npm test
+      - run: npm pack --dry-run
+      - run: npm audit --omit=dev
