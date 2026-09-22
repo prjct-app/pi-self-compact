@@ -27,7 +27,7 @@ Lines are absolute because context rot follows tokens, not window share; on a sm
 
 1. Guidance rides on each request as a transient message and is never persisted. Each crossing prints it once in the transcript.
 2. `self_compact(note_to_self)` saves the note (1–24,000 chars) and ends the run. It refuses, without locking, when the session still fits inside Pi's `keepRecentTokens`.
-3. Once Pi is idle the session is compacted through Pi's own `compact()` with a structured summary prompt that leaves the note to the note.
+3. Once Pi is idle the session is compacted with a structured summary prompt that leaves the note to the note. The summary request extends the last session request, so the provider serves the shared prefix from its prompt cache; Pi's own `compact()` with the history replayed as text is the fallback. List `pi-self-compact` last in `packages` so it reuses the provider body after other extensions rewrite it.
 4. The note returns byte for byte as the next message and starts the next turn. Tools unlock.
 
 Nobody has to prompt it. When a run stops at or past the warning line (a finished turn, or a session resumed there), the extension asks the agent to write its note and compact, at most twice per cycle so an agent that ignores it cannot loop. Each crossing and each handoff prints one line in the transcript; expand it to see the exact guidance or note the model receives.

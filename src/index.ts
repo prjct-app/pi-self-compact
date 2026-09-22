@@ -10,7 +10,9 @@ import {
   emptyState, GUIDANCE_TYPE, HANDOFF_TYPE, PHASE_TYPE, recoverState, STATE_TYPE,
   type EntryLike, type Handoff, type SelfCompactState,
 } from './state.ts';
-import { generateSummary, hasCompactionMaterial, keepRecentTokens } from './summary.ts';
+import {
+  cachedSummaryBlocker, generateCachedSummary, generateSummary, hasCompactionMaterial, keepRecentTokens, modelKey, type RequestSnapshot,
+} from './summary.ts';
 import {
   DEFAULT_SPECS, formatPct, LEVEL_ORDER, levelFor, resolveThresholds, SPEC_HELP,
   type Level, type ThresholdSpecs, type Thresholds,
@@ -98,6 +100,8 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
     alive: true,
     timers: new Map<string, ReturnType<typeof setTimeout>>(),
     promptErrors: new Set<string>(),
+    /** The last session request as sent, so the summary can extend its cached prefix. */
+    snapshot: undefined as RequestSnapshot | undefined,
   };
 
   const flag = (name: string): string | undefined => {
@@ -386,6 +390,7 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
 
   const recover = (reason: string, ctx: ExtensionContext): void => {
     clearTimers();
+    R.snapshot = undefined;
     R.alive = true;
     R.epoch += 1;
     R.announced = 'idle';
@@ -464,7 +469,24 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
     return { messages: [...event.messages, { role: 'custom' as const, customType: GUIDANCE_TYPE, content: text, display: false, timestamp: Date.now() }] };
   });
 
+  // Runs after every `context` handler, so the snapshot matches the request byte for byte
+  // (Pi 0.87+; older hosts never fire it and keep the replayed-text summary).
+  (pi.on as (event: string, handler: (event: { messages: readonly unknown[] }, ctx: ExtensionContext) => Promise<undefined>) => void)(
+    'context_with_system', async (event, ctx) => {
+      R.snapshot = ctx.model ? { model: modelKey(ctx.model), messages: event.messages, tail: [] } : undefined;
+      return undefined;
+    });
+
+  // The provider body as sent: Pi builds tool schemas on the session path that the
+  // transcript alone does not reproduce, so the summary reuses this body as its prefix.
+  // Handlers after this one still rewrite it; list self-compact last among packages.
+  pi.on('before_provider_request', async event => {
+    if (R.snapshot && !R.snapshot.payload) R.snapshot = { ...R.snapshot, payload: event.payload };
+    return undefined;
+  });
+
   pi.on('message_end', async (event, ctx) => {
+    if (R.snapshot) R.snapshot = { ...R.snapshot, tail: [...R.snapshot.tail, event.message] };
     if (event.message.role === 'assistant') {
       track(ctx);
       return;
@@ -537,6 +559,25 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
       return { cancel: true };
     }
     const errors: string[] = [];
+    // First choice extends the cached session request; replaying the history as text
+    // (billed in full) is the fallback when that cannot run or fails.
+    const blocker = cachedSummaryBlocker(event, ctx, R.snapshot, R.usage.tokens);
+    const snapshot = blocker ? undefined : R.snapshot;
+    if (snapshot) {
+      try {
+        const result = await generateCachedSummary(event, ctx, prompt, snapshot);
+        return { compaction: { ...result, details: {
+          ...result.details,
+          handoffId: handoff.id,
+          selfCompact: { cycle: R.state.cycle + 1, promptSource: prompt.source, noteChars: handoff.note.length, truncatedInput: false, attempt: 1,
+            summary: 'cache-shared', input: result.usage.input, cacheRead: result.usage.cacheRead },
+        } } };
+      } catch (error) {
+        errors.push(error instanceof Error ? error.message : String(error));
+        if (event.signal.aborted) return { cancel: true };
+      }
+    }
+    const fallback = blocker ?? `cache-shared summary failed: ${errors.at(-1) ?? 'unknown error'}`;
     for (const attempt of Array.from({ length: SUMMARY_ATTEMPTS }, (_, index) => index + 1)) {
       if (event.signal.aborted) return { cancel: true };
       try {
@@ -544,7 +585,8 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
         return { compaction: { ...result, details: {
           ...(result.details as Record<string, unknown> | undefined),
           handoffId: handoff.id,
-          selfCompact: { cycle: R.state.cycle + 1, promptSource: prompt.source, noteChars: handoff.note.length, truncatedInput, attempt },
+          selfCompact: { cycle: R.state.cycle + 1, promptSource: prompt.source, noteChars: handoff.note.length, truncatedInput, attempt,
+            summary: 'replayed', fallback, input: result.usage?.input, cacheRead: result.usage?.cacheRead },
         } } };
       } catch (error) {
         errors.push(error instanceof Error ? error.message : String(error));
@@ -557,6 +599,7 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
   });
 
   pi.on('session_compact', async (event, ctx) => {
+    R.snapshot = undefined;
     R.epoch += 1;
     R.announced = 'idle';
     R.inFlight = false;
