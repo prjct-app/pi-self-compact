@@ -274,7 +274,7 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
   pi.registerTool({
     name: CONTEXT_USAGE_TOOL,
     label: 'Context Usage',
-    description: `Your own context usage as JSON: used tokens and percent, the window, the self-compact level, the notice, warning and hard-cutoff lines, and the tokens left before each. You cannot see these numbers otherwise. Call it when deciding something (after a compaction, before a large read, when judging whether to call ${SELF_COMPACT_TOOL}); a message arrives on its own when a line is crossed.`,
+    description: `${SYSTEM_POLICY}\n\nYour own context usage as JSON: used tokens and percent, the window, the self-compact level, the notice, warning and hard-cutoff lines, and the tokens left before each. You cannot see these numbers otherwise. Call it when deciding something (after a compaction, before a large read, when judging whether to call ${SELF_COMPACT_TOOL}); a message arrives on its own when a line is crossed.`,
     promptSnippet: 'Show your context usage and the self-compact thresholds as JSON',
     parameters: Type.Object({}, { additionalProperties: false }),
     async execute(_id, _params, _signal, _onUpdate, ctx) {
@@ -438,9 +438,9 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
 
   pi.on('before_agent_start', async (event, ctx) => {
     track(ctx);
-    // Independent of the live level, so the cached system prefix never changes mid-session.
-    if (R.disabled || event.systemPrompt.includes(SYSTEM_POLICY)) return undefined;
-    return { systemPrompt: `${event.systemPrompt}\n\n${SYSTEM_POLICY}` };
+    // The policy rides on the context_usage tool description: a per-turn system
+    // prompt is dropped on automated turns and flipped the cached prefix.
+    return undefined;
   });
 
   pi.on('context', async (event, ctx) => {
