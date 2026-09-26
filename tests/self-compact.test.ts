@@ -8,7 +8,7 @@ import { installSelfCompact } from '../src/index.ts';
 import { BUILTIN_PROMPTS, loadPrompt, renderTemplate } from '../src/prompts.ts';
 import { HANDOFF_TYPE, recoverState, STATE_TYPE, type EntryLike } from '../src/state.ts';
 import { cachedSummaryBlocker, extendPayload } from '../src/summary.ts';
-import { levelFor, parseSpec, resolveThresholds, DEFAULT_SPECS } from '../src/thresholds.ts';
+import { levelFor, loadThresholdFile, parseSpec, resolveThresholds, DEFAULT_SPECS } from '../src/thresholds.ts';
 
 // keepRecentTokens reads Pi settings; never let the developer's own settings leak in.
 process.env.PI_CODING_AGENT_DIR = await mkdtemp(join(tmpdir(), 'pi-memory-sc-agent-'));
@@ -48,6 +48,21 @@ test('explicit lines are validated and the cutoff is capped at 90% of the window
   assert.equal(tooHigh.ok, false);
   const noWindow = resolveThresholds(DEFAULT_SPECS, 0, true);
   assert.equal(noWindow.ok, false);
+});
+
+test('thresholds.json sets persistent lines, project before global, and rejects bad files', async t => {
+  const project = await mkdtemp(join(tmpdir(), 'pi-memory-sc-th-project-'));
+  const global = await mkdtemp(join(tmpdir(), 'pi-memory-sc-th-global-'));
+  t.after(() => Promise.all([project, global].map(dir => rm(dir, { recursive: true, force: true }))));
+  assert.equal(loadThresholdFile([project, global]), undefined);
+  await writeFile(join(global, 'thresholds.json'), '{ "softAt": "90k", "at": 110000 }');
+  assert.deepEqual(loadThresholdFile([project, global]), { path: join(global, 'thresholds.json'), specs: { softAt: '90k', at: '110000' } });
+  await writeFile(join(project, 'thresholds.json'), '{ "at": "40%" }');
+  assert.deepEqual(loadThresholdFile([project, global])?.specs, { at: '40%' });
+  await writeFile(join(project, 'thresholds.json'), '{ "warn": "1k" }');
+  assert.throws(() => loadThresholdFile([project, global]), /unknown keys warn/);
+  await writeFile(join(project, 'thresholds.json'), '{ nope');
+  assert.throws(() => loadThresholdFile([project, global]), /thresholds\.json/);
 });
 
 test('prompt overrides are read fresh, placeholders render, and empty overrides are errors', async t => {
@@ -302,6 +317,29 @@ test('a project prompt override replaces the built-in guidance', async t => {
   h.gauge.tokens = 120_000;
   const [result] = await h.emit('context', { messages: [] });
   assert.equal(result.messages[0].content, 'custom notice at 44.1%');
+});
+
+test('a project thresholds.json moves the lines, and a bad one disables self-compact', async t => {
+  const cwd = await mkdtemp(join(tmpdir(), 'pi-self-compact-thresholds-'));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const dir = join(cwd, '.pi', 'self-compact');
+  await mkdir(dir, { recursive: true });
+  await writeFile(join(dir, 'thresholds.json'), '{ "softAt": "200k", "at": "220k", "buffer": "20k" }');
+  const h = host(cwd);
+  const controller = installSelfCompact(h.pi);
+  assert.ok(controller);
+  await h.emit('session_start', { reason: 'startup' });
+  const lines = controller.describe(h.ctx);
+  assert.ok(lines.includes('state active'));
+  assert.ok(lines.includes(`lines notice 200,000 · warning 220,000 · cutoff 240,000 · from ${join(dir, 'thresholds.json')}`));
+  // Past the old default warning line but under the file's notice line: no guidance.
+  h.gauge.tokens = 160_000;
+  assert.deepEqual(await h.emit('context', { messages: [] }), [undefined]);
+  await writeFile(join(dir, 'thresholds.json'), '{ "warn": "1k" }');
+  await h.emit('session_start', { reason: 'reload' });
+  assert.match(controller.describe(h.ctx)[0] ?? '', /^state rejected: .*unknown keys warn/);
+  h.gauge.tokens = 260_000;
+  assert.deepEqual(await h.emit('context', { messages: [] }), [undefined]);
 });
 
 test('/self-compact reports status, asks for a note on now, and rejects other words', async t => {

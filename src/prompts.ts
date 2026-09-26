@@ -77,8 +77,10 @@ export const BUILTIN_PROMPTS: Readonly<Record<PromptKey, string>> = { soft: SOFT
 
 export type LoadedPrompt = Readonly<{ text: string; source: string }>;
 
-export const promptDirs = (cwd: string, home = homedir()): readonly string[] =>
-  [join(cwd, '.pi', 'self-compact'), join(home, '.pi', 'agent', 'self-compact')];
+export const promptDirs = (
+  cwd: string,
+  agentDir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), '.pi', 'agent'),
+): readonly string[] => [join(cwd, '.pi', 'self-compact'), join(agentDir, 'self-compact')];
 
 /** An override file that exists but is empty or unreadable is an error, never a silent fallback. */
 export const loadPrompt = (key: PromptKey, dirs: readonly string[]): LoadedPrompt => {

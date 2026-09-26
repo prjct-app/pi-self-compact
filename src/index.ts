@@ -14,7 +14,7 @@ import {
   cachedSummaryBlocker, generateCachedSummary, generateSummary, hasCompactionMaterial, keepRecentTokens, modelKey, type RequestSnapshot,
 } from './summary.ts';
 import {
-  DEFAULT_SPECS, formatPct, LEVEL_ORDER, levelFor, resolveThresholds, SPEC_HELP,
+  DEFAULT_SPECS, formatPct, LEVEL_ORDER, levelFor, loadThresholdFile, resolveThresholds, SPEC_HELP,
   type Level, type ThresholdSpecs, type Thresholds,
 } from './thresholds.ts';
 
@@ -84,6 +84,10 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
     fromDefaults: true,
     compactPrompt: undefined as string | undefined,
     error: undefined as string | undefined,
+    /** A thresholds.json that exists but was rejected; disables self-compact like a bad flag. */
+    fileError: undefined as string | undefined,
+    /** Where the lines came from, for /self-compact status. */
+    specSource: 'defaults',
     thresholds: undefined as Thresholds | undefined,
     dirs: [] as readonly string[],
     usage: { tokens: null, percent: null, window: 0 } as Usage,
@@ -134,21 +138,29 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
   };
 
   const loadSettings = (ctx: ExtensionContext): void => {
+    R.fileError = undefined;
     R.disabled = pi.getFlag('no-self-compact') === true;
     const soft = flag('compact-soft-at');
     const at = flag('compact-at');
     const buffer = flag('compact-buffer');
-    R.specs = { ...DEFAULT_SPECS, ...options.thresholds, ...(soft ? { softAt: soft } : {}), ...(at ? { at } : {}), ...(buffer ? { buffer } : {}) };
-    R.fromDefaults = !soft && !at && !buffer && !options.thresholds;
     R.compactPrompt = flag('compact-prompt');
     R.dirs = [...(options.promptDirs ?? []), ...promptDirs(ctx.cwd)];
+    const file = (() => {
+      try { return loadThresholdFile(R.dirs); } catch (error) {
+        R.fileError = error instanceof Error ? error.message : String(error);
+        return undefined;
+      }
+    })();
+    R.specs = { ...DEFAULT_SPECS, ...options.thresholds, ...file?.specs, ...(soft ? { softAt: soft } : {}), ...(at ? { at } : {}), ...(buffer ? { buffer } : {}) };
+    R.fromDefaults = !soft && !at && !buffer && !options.thresholds && !file;
+    R.specSource = soft || at || buffer ? 'flags' : file ? file.path : options.thresholds ? 'options' : 'defaults';
   };
 
   const resolve = (ctx: ExtensionContext): void => {
     const resolution = resolveThresholds(R.specs, ctx.model?.contextWindow ?? 0, R.fromDefaults);
-    R.thresholds = resolution.ok ? resolution.thresholds : undefined;
+    R.thresholds = resolution.ok && !R.fileError ? resolution.thresholds : undefined;
     // A missing window is not a settings error: the guard simply waits for a model that reports one.
-    R.error = resolution.ok || !ctx.model?.contextWindow ? undefined : resolution.error;
+    R.error = R.fileError ?? (resolution.ok || !ctx.model?.contextWindow ? undefined : resolution.error);
     if (R.error) notify(ctx, `self-compact disabled: ${R.error}`, 'error');
   };
 
@@ -660,7 +672,7 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
       return [
         `state ${R.disabled ? 'disabled' : R.error ? `rejected: ${R.error}` : t ? 'active' : 'waiting for a model window'}`,
         `usage ${R.usage.tokens === null ? 'unknown' : `${fmt(R.usage.tokens)} tokens (${formatPct(R.usage.percent)})`} of ${fmt(R.usage.window)}`,
-        t ? `lines notice ${fmt(t.softTokens)} · warning ${fmt(t.warnTokens)} · cutoff ${fmt(t.forcedTokens)}${t.clamped ? ' (clamped to window)' : ''}` : `lines ${R.specs.softAt} / ${R.specs.at} / +${R.specs.buffer}`,
+        t ? `lines notice ${fmt(t.softTokens)} · warning ${fmt(t.warnTokens)} · cutoff ${fmt(t.forcedTokens)}${t.clamped ? ' (clamped to window)' : ''} · from ${R.specSource}` : `lines ${R.specs.softAt} / ${R.specs.at} / +${R.specs.buffer} · from ${R.specSource}`,
         `level ${R.level} · tools ${R.state.locked ? 'LOCKED' : 'unlocked'} · cycles ${R.state.cycle}`,
         ...(handoff ? [`note ${handoff.status} · ${fmt(handoff.note.length)} chars${handoff.error ? ` · ${handoff.error}` : ''}`] : []),
       ];
