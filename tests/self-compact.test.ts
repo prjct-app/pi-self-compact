@@ -7,7 +7,8 @@ import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { installSelfCompact } from '../src/index.ts';
 import { BUILTIN_PROMPTS, loadPrompt, renderTemplate } from '../src/prompts.ts';
 import { HANDOFF_TYPE, recoverState, STATE_TYPE, type EntryLike } from '../src/state.ts';
-import { levelFor, parseSpec, resolveThresholds, DEFAULT_SPECS } from '../src/thresholds.ts';
+import { cachedSummaryBlocker, extendPayload } from '../src/summary.ts';
+import { levelFor, loadThresholdFile, parseSpec, resolveThresholds, DEFAULT_SPECS } from '../src/thresholds.ts';
 
 // keepRecentTokens reads Pi settings; never let the developer's own settings leak in.
 process.env.PI_CODING_AGENT_DIR = await mkdtemp(join(tmpdir(), 'pi-memory-sc-agent-'));
@@ -47,6 +48,21 @@ test('explicit lines are validated and the cutoff is capped at 90% of the window
   assert.equal(tooHigh.ok, false);
   const noWindow = resolveThresholds(DEFAULT_SPECS, 0, true);
   assert.equal(noWindow.ok, false);
+});
+
+test('thresholds.json sets persistent lines, project before global, and rejects bad files', async t => {
+  const project = await mkdtemp(join(tmpdir(), 'pi-memory-sc-th-project-'));
+  const global = await mkdtemp(join(tmpdir(), 'pi-memory-sc-th-global-'));
+  t.after(() => Promise.all([project, global].map(dir => rm(dir, { recursive: true, force: true }))));
+  assert.equal(loadThresholdFile([project, global]), undefined);
+  await writeFile(join(global, 'thresholds.json'), '{ "softAt": "90k", "at": 110000 }');
+  assert.deepEqual(loadThresholdFile([project, global]), { path: join(global, 'thresholds.json'), specs: { softAt: '90k', at: '110000' } });
+  await writeFile(join(project, 'thresholds.json'), '{ "at": "40%" }');
+  assert.deepEqual(loadThresholdFile([project, global])?.specs, { at: '40%' });
+  await writeFile(join(project, 'thresholds.json'), '{ "warn": "1k" }');
+  assert.throws(() => loadThresholdFile([project, global]), /unknown keys warn/);
+  await writeFile(join(project, 'thresholds.json'), '{ nope');
+  assert.throws(() => loadThresholdFile([project, global]), /thresholds\.json/);
 });
 
 test('prompt overrides are read fresh, placeholders render, and empty overrides are errors', async t => {
@@ -171,6 +187,70 @@ test('a full cycle: guidance, forced lock, note, compaction, verbatim return, un
   assert.match(controller.describe(h.ctx).join('\n'), /cycles 1/);
 });
 
+test('the summary extends the cached session request instead of replaying it as text', async t => {
+  const cwd = await mkdtemp(join(tmpdir(), 'pi-memory-sc-cached-'));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const h = host(cwd);
+  installSelfCompact(h.pi);
+  await h.emit('session_start', { reason: 'startup' });
+  const requests: { context: any; options: any }[] = [];
+  h.ctx.modelRegistry = {
+    streamSimple(_model: unknown, context: unknown, options: unknown) {
+      requests.push({ context, options });
+      return { result: async () => ({ role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: 'SUMMARY' }],
+        usage: { input: 900, output: 300, cacheRead: 150_000, cacheWrite: 0, totalTokens: 151_200 } }) };
+    },
+  };
+  h.gauge.tokens = 155_000;
+  const system = { role: 'system', content: 'PROMPT', timestamp: 0 };
+  const sent = [system, ...h.entries.filter(entry => entry.type === 'message').map(entry => entry.message)];
+  await h.emit('context_with_system', { messages: sent });
+  const answer = { role: 'assistant', content: [{ type: 'toolCall', id: 'c1', name: 'self_compact', arguments: {} }], timestamp: 4 };
+  const toolResult = { role: 'toolResult', toolCallId: 'c1', toolName: 'self_compact', content: [{ type: 'text', text: 'saved' }], timestamp: 5 };
+  for (const message of [answer, toolResult]) {
+    await h.emit('message_end', { message });
+    h.entries.push({ type: 'message', id: `m${message.timestamp}`, parentId: null, timestamp: new Date().toISOString(), message });
+  }
+  await h.tools.get('self_compact').execute('c1', { note_to_self: 'NEXT ACTION: test' }, undefined, undefined, h.ctx);
+
+  const preparation = { firstKeptEntryId: 'u2', tokensBefore: 155_000, messagesToSummarize: [], turnPrefixMessages: [], isSplitTurn: false,
+    fileOps: { read: new Set(['a.ts', 'b.ts']), written: new Set<string>(), edited: new Set(['b.ts']) } };
+  const [result] = await h.emit('session_before_compact', { reason: 'manual', preparation, signal: new AbortController().signal });
+  assert.equal(requests.length, 1, 'one request, no replay');
+  const { context, options } = requests[0]!;
+  assert.deepEqual(context.messages.slice(0, -1), [...sent, answer, toolResult], 'the sent transcript is the unchanged prefix');
+  assert.equal(context.messages.at(-1).role, 'user');
+  assert.equal(context.systemPrompt, undefined, 'the system prompt stays the session one');
+  assert.equal(options.sessionId, 'sc-session', 'routed to the session cache');
+  assert.equal(options.cacheRetention, undefined);
+  assert.equal(result.compaction.summary, 'SUMMARY\n\n<read-files>\na.ts\n</read-files>\n\n<modified-files>\nb.ts\n</modified-files>');
+  assert.equal(result.compaction.firstKeptEntryId, 'u2');
+  assert.equal(result.compaction.details.selfCompact.summary, 'cache-shared');
+  assert.equal(result.compaction.details.selfCompact.cacheRead, 150_000);
+});
+
+test('the summary body is the session body with only the new input items appended', () => {
+  const session = { model: 'm', tools: [{ name: 'grep', parameters: { properties: {} } }], service_tier: 'priority', input: [{ n: 1 }, { n: 2 }] };
+  const rebuilt = { model: 'm', tools: [{ name: 'grep', strict: null }], input: [{ n: 1 }, { n: 2 }, { n: 3 }, { task: true }] };
+  assert.deepEqual(extendPayload(session, rebuilt), { ...session, input: [{ n: 1 }, { n: 2 }, { n: 3 }, { task: true }] });
+  assert.equal(extendPayload(session, { input: [{ n: 9 }] }), undefined, 'no anchor: the rebuilt body goes out unchanged');
+  assert.equal(extendPayload(undefined, rebuilt), undefined);
+  assert.equal(extendPayload({ messages: [] }, rebuilt), undefined, 'non-Responses payloads are left alone');
+});
+
+test('the cache-shared summary is skipped when its snapshot cannot be trusted', () => {
+  const entries = [{ type: 'message', message: { role: 'user', timestamp: 7 } }];
+  const ctx: any = { model: { provider: 'test', id: 'm', contextWindow: 272_000 }, sessionManager: { getBranch: () => entries } };
+  const snapshot = { model: 'test/m', messages: [{ role: 'system' }, { role: 'user', timestamp: 7 }], tail: [] };
+  const manual: any = { reason: 'manual' };
+  assert.equal(cachedSummaryBlocker(manual, ctx, snapshot, 150_000), undefined);
+  assert.match(cachedSummaryBlocker(manual, ctx, undefined, 150_000)!, /no session request/);
+  assert.match(cachedSummaryBlocker(manual, ctx, { ...snapshot, model: 'test/other' }, 150_000)!, /model changed/);
+  assert.match(cachedSummaryBlocker({ reason: 'overflow' } as any, ctx, snapshot, 150_000)!, /overflow/);
+  assert.match(cachedSummaryBlocker(manual, ctx, snapshot, 265_000)!, /no room/);
+  assert.match(cachedSummaryBlocker(manual, ctx, { ...snapshot, messages: snapshot.messages.slice(0, 1) }, 150_000)!, /moved past/);
+});
+
 test('a sibling of self_compact in the same batch is blocked and ends the run', async t => {
   const cwd = await mkdtemp(join(tmpdir(), 'pi-memory-sc-batch-'));
   t.after(() => rm(cwd, { recursive: true, force: true }));
@@ -237,6 +317,29 @@ test('a project prompt override replaces the built-in guidance', async t => {
   h.gauge.tokens = 120_000;
   const [result] = await h.emit('context', { messages: [] });
   assert.equal(result.messages[0].content, 'custom notice at 44.1%');
+});
+
+test('a project thresholds.json moves the lines, and a bad one disables self-compact', async t => {
+  const cwd = await mkdtemp(join(tmpdir(), 'pi-self-compact-thresholds-'));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const dir = join(cwd, '.pi', 'self-compact');
+  await mkdir(dir, { recursive: true });
+  await writeFile(join(dir, 'thresholds.json'), '{ "softAt": "200k", "at": "220k", "buffer": "20k" }');
+  const h = host(cwd);
+  const controller = installSelfCompact(h.pi);
+  assert.ok(controller);
+  await h.emit('session_start', { reason: 'startup' });
+  const lines = controller.describe(h.ctx);
+  assert.ok(lines.includes('state active'));
+  assert.ok(lines.includes(`lines notice 200,000 · warning 220,000 · cutoff 240,000 · from ${join(dir, 'thresholds.json')}`));
+  // Past the old default warning line but under the file's notice line: no guidance.
+  h.gauge.tokens = 160_000;
+  assert.deepEqual(await h.emit('context', { messages: [] }), [undefined]);
+  await writeFile(join(dir, 'thresholds.json'), '{ "warn": "1k" }');
+  await h.emit('session_start', { reason: 'reload' });
+  assert.match(controller.describe(h.ctx)[0] ?? '', /^state rejected: .*unknown keys warn/);
+  h.gauge.tokens = 260_000;
+  assert.deepEqual(await h.emit('context', { messages: [] }), [undefined]);
 });
 
 test('/self-compact reports status, asks for a note on now, and rejects other words', async t => {

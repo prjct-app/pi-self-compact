@@ -10,9 +10,11 @@ import {
   emptyState, GUIDANCE_TYPE, HANDOFF_TYPE, PHASE_TYPE, recoverState, STATE_TYPE,
   type EntryLike, type Handoff, type SelfCompactState,
 } from './state.ts';
-import { generateSummary, hasCompactionMaterial, keepRecentTokens } from './summary.ts';
 import {
-  DEFAULT_SPECS, formatPct, LEVEL_ORDER, levelFor, resolveThresholds, SPEC_HELP,
+  cachedSummaryBlocker, generateCachedSummary, generateSummary, hasCompactionMaterial, keepRecentTokens, modelKey, type RequestSnapshot,
+} from './summary.ts';
+import {
+  DEFAULT_SPECS, formatPct, LEVEL_ORDER, levelFor, loadThresholdFile, resolveThresholds, SPEC_HELP,
   type Level, type ThresholdSpecs, type Thresholds,
 } from './thresholds.ts';
 
@@ -82,6 +84,10 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
     fromDefaults: true,
     compactPrompt: undefined as string | undefined,
     error: undefined as string | undefined,
+    /** A thresholds.json that exists but was rejected; disables self-compact like a bad flag. */
+    fileError: undefined as string | undefined,
+    /** Where the lines came from, for /self-compact status. */
+    specSource: 'defaults',
     thresholds: undefined as Thresholds | undefined,
     dirs: [] as readonly string[],
     usage: { tokens: null, percent: null, window: 0 } as Usage,
@@ -98,6 +104,8 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
     alive: true,
     timers: new Map<string, ReturnType<typeof setTimeout>>(),
     promptErrors: new Set<string>(),
+    /** The last session request as sent, so the summary can extend its cached prefix. */
+    snapshot: undefined as RequestSnapshot | undefined,
   };
 
   const flag = (name: string): string | undefined => {
@@ -130,21 +138,29 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
   };
 
   const loadSettings = (ctx: ExtensionContext): void => {
+    R.fileError = undefined;
     R.disabled = pi.getFlag('no-self-compact') === true;
     const soft = flag('compact-soft-at');
     const at = flag('compact-at');
     const buffer = flag('compact-buffer');
-    R.specs = { ...DEFAULT_SPECS, ...options.thresholds, ...(soft ? { softAt: soft } : {}), ...(at ? { at } : {}), ...(buffer ? { buffer } : {}) };
-    R.fromDefaults = !soft && !at && !buffer && !options.thresholds;
     R.compactPrompt = flag('compact-prompt');
     R.dirs = [...(options.promptDirs ?? []), ...promptDirs(ctx.cwd)];
+    const file = (() => {
+      try { return loadThresholdFile(R.dirs); } catch (error) {
+        R.fileError = error instanceof Error ? error.message : String(error);
+        return undefined;
+      }
+    })();
+    R.specs = { ...DEFAULT_SPECS, ...options.thresholds, ...file?.specs, ...(soft ? { softAt: soft } : {}), ...(at ? { at } : {}), ...(buffer ? { buffer } : {}) };
+    R.fromDefaults = !soft && !at && !buffer && !options.thresholds && !file;
+    R.specSource = soft || at || buffer ? 'flags' : file ? file.path : options.thresholds ? 'options' : 'defaults';
   };
 
   const resolve = (ctx: ExtensionContext): void => {
     const resolution = resolveThresholds(R.specs, ctx.model?.contextWindow ?? 0, R.fromDefaults);
-    R.thresholds = resolution.ok ? resolution.thresholds : undefined;
+    R.thresholds = resolution.ok && !R.fileError ? resolution.thresholds : undefined;
     // A missing window is not a settings error: the guard simply waits for a model that reports one.
-    R.error = resolution.ok || !ctx.model?.contextWindow ? undefined : resolution.error;
+    R.error = R.fileError ?? (resolution.ok || !ctx.model?.contextWindow ? undefined : resolution.error);
     if (R.error) notify(ctx, `self-compact disabled: ${R.error}`, 'error');
   };
 
@@ -386,6 +402,7 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
 
   const recover = (reason: string, ctx: ExtensionContext): void => {
     clearTimers();
+    R.snapshot = undefined;
     R.alive = true;
     R.epoch += 1;
     R.announced = 'idle';
@@ -464,7 +481,24 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
     return { messages: [...event.messages, { role: 'custom' as const, customType: GUIDANCE_TYPE, content: text, display: false, timestamp: Date.now() }] };
   });
 
+  // Runs after every `context` handler, so the snapshot matches the request byte for byte
+  // (Pi 0.87+; older hosts never fire it and keep the replayed-text summary).
+  (pi.on as (event: string, handler: (event: { messages: readonly unknown[] }, ctx: ExtensionContext) => Promise<undefined>) => void)(
+    'context_with_system', async (event, ctx) => {
+      R.snapshot = ctx.model ? { model: modelKey(ctx.model), messages: event.messages, tail: [] } : undefined;
+      return undefined;
+    });
+
+  // The provider body as sent: Pi builds tool schemas on the session path that the
+  // transcript alone does not reproduce, so the summary reuses this body as its prefix.
+  // Handlers after this one still rewrite it; list self-compact last among packages.
+  pi.on('before_provider_request', async event => {
+    if (R.snapshot && !R.snapshot.payload) R.snapshot = { ...R.snapshot, payload: event.payload };
+    return undefined;
+  });
+
   pi.on('message_end', async (event, ctx) => {
+    if (R.snapshot) R.snapshot = { ...R.snapshot, tail: [...R.snapshot.tail, event.message] };
     if (event.message.role === 'assistant') {
       track(ctx);
       return;
@@ -537,6 +571,25 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
       return { cancel: true };
     }
     const errors: string[] = [];
+    // First choice extends the cached session request; replaying the history as text
+    // (billed in full) is the fallback when that cannot run or fails.
+    const blocker = cachedSummaryBlocker(event, ctx, R.snapshot, R.usage.tokens);
+    const snapshot = blocker ? undefined : R.snapshot;
+    if (snapshot) {
+      try {
+        const result = await generateCachedSummary(event, ctx, prompt, snapshot);
+        return { compaction: { ...result, details: {
+          ...result.details,
+          handoffId: handoff.id,
+          selfCompact: { cycle: R.state.cycle + 1, promptSource: prompt.source, noteChars: handoff.note.length, truncatedInput: false, attempt: 1,
+            summary: 'cache-shared', input: result.usage.input, cacheRead: result.usage.cacheRead },
+        } } };
+      } catch (error) {
+        errors.push(error instanceof Error ? error.message : String(error));
+        if (event.signal.aborted) return { cancel: true };
+      }
+    }
+    const fallback = blocker ?? `cache-shared summary failed: ${errors.at(-1) ?? 'unknown error'}`;
     for (const attempt of Array.from({ length: SUMMARY_ATTEMPTS }, (_, index) => index + 1)) {
       if (event.signal.aborted) return { cancel: true };
       try {
@@ -544,7 +597,8 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
         return { compaction: { ...result, details: {
           ...(result.details as Record<string, unknown> | undefined),
           handoffId: handoff.id,
-          selfCompact: { cycle: R.state.cycle + 1, promptSource: prompt.source, noteChars: handoff.note.length, truncatedInput, attempt },
+          selfCompact: { cycle: R.state.cycle + 1, promptSource: prompt.source, noteChars: handoff.note.length, truncatedInput, attempt,
+            summary: 'replayed', fallback, input: result.usage?.input, cacheRead: result.usage?.cacheRead },
         } } };
       } catch (error) {
         errors.push(error instanceof Error ? error.message : String(error));
@@ -557,6 +611,7 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
   });
 
   pi.on('session_compact', async (event, ctx) => {
+    R.snapshot = undefined;
     R.epoch += 1;
     R.announced = 'idle';
     R.inFlight = false;
@@ -617,7 +672,7 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
       return [
         `state ${R.disabled ? 'disabled' : R.error ? `rejected: ${R.error}` : t ? 'active' : 'waiting for a model window'}`,
         `usage ${R.usage.tokens === null ? 'unknown' : `${fmt(R.usage.tokens)} tokens (${formatPct(R.usage.percent)})`} of ${fmt(R.usage.window)}`,
-        t ? `lines notice ${fmt(t.softTokens)} · warning ${fmt(t.warnTokens)} · cutoff ${fmt(t.forcedTokens)}${t.clamped ? ' (clamped to window)' : ''}` : `lines ${R.specs.softAt} / ${R.specs.at} / +${R.specs.buffer}`,
+        t ? `lines notice ${fmt(t.softTokens)} · warning ${fmt(t.warnTokens)} · cutoff ${fmt(t.forcedTokens)}${t.clamped ? ' (clamped to window)' : ''} · from ${R.specSource}` : `lines ${R.specs.softAt} / ${R.specs.at} / +${R.specs.buffer} · from ${R.specSource}`,
         `level ${R.level} · tools ${R.state.locked ? 'LOCKED' : 'unlocked'} · cycles ${R.state.cycle}`,
         ...(handoff ? [`note ${handoff.status} · ${fmt(handoff.note.length)} chars${handoff.error ? ` · ${handoff.error}` : ''}`] : []),
       ];

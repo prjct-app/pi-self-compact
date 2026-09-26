@@ -1,3 +1,6 @@
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+
 /**
  * Self-compact thresholds. Adapted from disler/self-compact-pi-agent
  * (MIT, Copyright (c) 2026 IndyDevDan).
@@ -17,6 +20,30 @@ export type ThresholdSpecs = Readonly<{
 }>;
 
 export const DEFAULT_SPECS: ThresholdSpecs = { softAt: '100k', at: '150k', buffer: '30k' };
+
+export const THRESHOLDS_FILE = 'thresholds.json';
+
+/**
+ * Persistent lines from `thresholds.json` in the first prompt-override directory
+ * that has one (project before global); flags still win. A file that exists but
+ * does not parse is an error, never a silent fallback.
+ */
+export const loadThresholdFile = (dirs: readonly string[]): Readonly<{ path: string; specs: Partial<ThresholdSpecs> }> | undefined => {
+  const path = dirs.map(dir => join(dir, THRESHOLDS_FILE)).find(candidate => existsSync(candidate));
+  if (!path) return undefined;
+  const parsed: unknown = (() => {
+    try { return JSON.parse(readFileSync(path, 'utf8')); } catch (error) {
+      throw new Error(`${path}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  })();
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) throw new Error(`${path}: expected an object with softAt, at and buffer.`);
+  const entries = Object.entries(parsed as Record<string, unknown>);
+  const unknown = entries.filter(([key]) => !['softAt', 'at', 'buffer'].includes(key)).map(([key]) => key);
+  if (unknown.length) throw new Error(`${path}: unknown keys ${unknown.join(', ')}; use softAt, at and buffer.`);
+  const bad = entries.filter(([, value]) => typeof value !== 'string' && typeof value !== 'number').map(([key]) => key);
+  if (bad.length) throw new Error(`${path}: ${bad.join(', ')} must be a string like "110k" or "40%", or a token count.`);
+  return { path, specs: Object.fromEntries(entries.map(([key, value]) => [key, String(value)])) as Partial<ThresholdSpecs> };
+};
 
 /** Default lines never sit above these window fractions, so a 128k model still has room to work. */
 export const DEFAULT_CAPS = { soft: 0.5, warn: 0.65, forced: 0.8 } as const;

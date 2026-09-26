@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- `thresholds.json` in `.pi/self-compact/` (project) or `~/.pi/agent/self-compact/` (global) sets persistent lines; flags still win. A bad file disables self-compact with the reason, and `/self-compact` shows where the lines came from.
+- The global override directory follows `PI_CODING_AGENT_DIR`.
+- The summary extends the last session request (same provider body, same session id, one extra message) instead of replaying the history as text, so the provider bills the shared prefix as cached input. Measured on Codex: 48,000 of 49,417 input tokens cached, against 0 before. Falls back to the replayed summary on overflow, a model change, a stale snapshot or an error. List `pi-self-compact` last in `packages` so it sees the body after other extensions rewrite it.
+- One summary request per compaction, split turns included.
+- The compaction entry records `summary` (`cache-shared` or `replayed`), `input` and `cacheRead`.
+
 ## 0.2.1
 
 - The returned note renders as one line (`✓ self-compact · compacted from 200,833 tokens · cycle 1 · note returned to the agent`); expand it to read the note.
