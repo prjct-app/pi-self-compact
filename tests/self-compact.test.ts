@@ -7,7 +7,7 @@ import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { installSelfCompact } from '../src/index.ts';
 import { BUILTIN_PROMPTS, loadPrompt, renderTemplate } from '../src/prompts.ts';
 import { HANDOFF_TYPE, recoverState, STATE_TYPE, type EntryLike } from '../src/state.ts';
-import { cachedSummaryBlocker, extendPayload } from '../src/summary.ts';
+import { cachedSummaryBlocker, extendPayload, replaceInstructions, summaryInputs } from '../src/summary.ts';
 import { levelFor, loadThresholdFile, parseSpec, resolveThresholds, DEFAULT_SPECS } from '../src/thresholds.ts';
 
 // keepRecentTokens reads Pi settings; never let the developer's own settings leak in.
@@ -410,4 +410,24 @@ test('the returned note renders as one summary line and shows in full only when 
   assert.match(render(false), /compacted from 200,833 tokens · cycle 1 · note returned to the agent \(20 chars\)/);
   assert.doesNotMatch(render(false), /NEXT ACTION/);
   assert.match(render(true), /NEXT ACTION: go/);
+});
+
+test('split-turn summaries are recognized in the Pi 0.85 and 0.87 formats', () => {
+  const prefix: any[] = [{ role: 'user', content: 'refactor the parser', timestamp: 1 }];
+  const history: any[] = [{ role: 'user', content: 'earlier work', timestamp: 0 }];
+  const inputs = summaryInputs({ messagesToSummarize: history, turnPrefixMessages: prefix, previousSummary: undefined });
+  const [conversation] = inputs.filter(input => input.startsWith('# Conversation'));
+  const text = conversation!.slice('# Conversation\n'.length, -'\n\n# Instructions\n'.length);
+  const piPrompts = [
+    `<conversation>\n${text}\n</conversation>\n\nPI TURN PREFIX PROMPT`,
+    `# Conversation\n${text}\n\n# Instructions\nPI TURN PREFIX PROMPT`,
+  ];
+  for (const prompt of piPrompts) {
+    const context: any = { messages: [{ role: 'user', content: [{ type: 'text', text: prompt }], timestamp: 0 }] };
+    const { messages } = replaceInstructions(context, inputs, 'OURS', 1_000_000);
+    const out = (messages[0] as any).content[0].text as string;
+    assert.ok(out.endsWith('OURS') && !out.includes('PI TURN PREFIX PROMPT'), out);
+  }
+  const unknown: any = { messages: [{ role: 'user', content: [{ type: 'text', text: 'something else' }], timestamp: 0 }] };
+  assert.throws(() => replaceInstructions(unknown, inputs, 'OURS', 1_000_000), /Unrecognized Pi summary input/);
 });

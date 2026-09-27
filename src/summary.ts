@@ -38,6 +38,17 @@ type Messages = SessionBeforeCompactEvent['preparation']['messagesToSummarize'];
 const historyInput = (messages: Messages, previous?: string): string =>
   `<conversation>\n${serializeConversation(convertToLlm(messages))}\n</conversation>\n\n${previous ? `<previous-summary>\n${previous}\n</previous-summary>\n\n` : ''}`;
 
+/**
+ * Every input Pi's compact() may send, longest first: the history (with the
+ * previous summary) and the split-turn prefix. Pi 0.87 wraps the turn prefix in
+ * `# Conversation` / `# Instructions` headings instead of `<conversation>` tags.
+ */
+export const summaryInputs = (preparation: Pick<SessionBeforeCompactEvent['preparation'], 'messagesToSummarize' | 'previousSummary' | 'turnPrefixMessages'>): string[] => [
+  historyInput(preparation.messagesToSummarize, preparation.previousSummary),
+  historyInput(preparation.turnPrefixMessages),
+  `# Conversation\n${serializeConversation(convertToLlm(preparation.turnPrefixMessages))}\n\n# Instructions\n`,
+].sort((a, b) => b.length - a.length);
+
 const instructionsFor = (event: SessionBeforeCompactEvent): string => [
   'Summarize the supplied historical data. Do not continue the task, simulate tools, or claim actions without tool-result evidence. Keep pending actions pending.',
   event.preparation.isSplitTurn ? 'This is a split turn. Summarize only the supplied history or turn prefix; the recent suffix remains available.' : '',
@@ -45,7 +56,7 @@ const instructionsFor = (event: SessionBeforeCompactEvent): string => [
 ].filter(Boolean).join('\n\n');
 
 /** Match complete known inputs, so tag-like text inside the history cannot cut it short. */
-const replaceInstructions = (context: Context, inputs: readonly string[], instructions: string, budgetChars: number) => {
+export const replaceInstructions = (context: Context, inputs: readonly string[], instructions: string, budgetChars: number) => {
   const truncated = { value: false };
   // Pi 0.86 carries the system prompt as a leading system message as well as
   // `systemPrompt`; drop Pi's summarizer message so only ours applies.
@@ -67,10 +78,7 @@ const replaceInstructions = (context: Context, inputs: readonly string[], instru
 export const generateSummary = async (event: SessionBeforeCompactEvent, ctx: ExtensionContext, system: LoadedPrompt) => {
   const model = ctx.model;
   if (!model) throw new Error('No model available for compaction.');
-  const inputs = [
-    historyInput(event.preparation.messagesToSummarize, event.preparation.previousSummary),
-    historyInput(event.preparation.turnPrefixMessages),
-  ].sort((a, b) => b.length - a.length);
+  const inputs = summaryInputs(event.preparation);
   const instructions = instructionsFor(event);
   const truncated = { value: false };
   const result = await compact(
