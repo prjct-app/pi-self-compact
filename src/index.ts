@@ -17,6 +17,8 @@ import {
   DEFAULT_SPECS, formatPct, LEVEL_ORDER, levelFor, loadThresholdFile, resolveThresholds, SPEC_HELP,
   type Level, type ThresholdSpecs, type Thresholds,
 } from './thresholds.ts';
+import { connectJev, type ConnectJev, type Jev } from './jev.ts';
+import { MOMENT_QUESTIONS, momentLine, momentState, verdictOf, type Verdict } from './moment.ts';
 
 /**
  * Self-compact: the agent watches its own context, writes a note_to_self at a
@@ -51,6 +53,8 @@ export type SelfCompactOptions = Readonly<{
   thresholds?: Partial<ThresholdSpecs>;
   /** Extra directories searched for prompt overrides, before the defaults. */
   promptDirs?: readonly string[];
+  /** Injected by the tests; the real one reads the shared TypeSafe key. */
+  jev?: ConnectJev;
 }>;
 
 type Usage = Readonly<{ tokens: number | null; percent: number | null; window: number }>;
@@ -106,6 +110,14 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
     promptErrors: new Set<string>(),
     /** The last session request as sent, so the summary can extend its cached prefix. */
     snapshot: undefined as RequestSnapshot | undefined,
+    /** Jev, looked up the first time a line is crossed; undefined inside means no key. */
+    jev: undefined as Promise<Jev | undefined> | undefined,
+    /** Finished turns; a verdict only counts for the turn it judged. */
+    turns: 0,
+    moment: undefined as { epoch: number; turn: number; verdict: Verdict } | undefined,
+    judging: false,
+    /** The epoch an early handoff was already asked in: once per context is enough. */
+    movedOnAsked: -1,
   };
 
   const flag = (name: string): string | undefined => {
@@ -254,14 +266,57 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
    * At the warning line or past it, an idle agent is asked to hand off on its
    * own: the person never has to type anything for the run to compact.
    */
-  const requestHandoff = (ctx: ExtensionContext, followUp: boolean): void => {
+  const requestHandoff = (ctx: ExtensionContext, followUp: boolean, movedOn = false): void => {
     if (!active() || pending() || R.autoRequests >= MAX_AUTO_REQUESTS) return;
     const level: Level = R.state.locked ? 'forced' : R.level;
-    if ((level !== 'warning' && level !== 'forced') || !compactable(ctx)) return;
+    const early = movedOn && level === 'notice';
+    if ((level !== 'warning' && level !== 'forced' && !early) || !compactable(ctx)) return;
     R.autoRequests += 1;
     pi.sendMessage({ customType: GUIDANCE_TYPE, content: compactNowPrompt(), display: true,
-      details: { level, percent: R.usage.percent, auto: true } },
+      details: { level, percent: R.usage.percent, auto: true, ...(early ? { movedOn: true } : {}) } },
     followUp ? { triggerTurn: true, deliverAs: 'followUp' } : { triggerTurn: true });
+  };
+
+  /** Jev's verdict on the turn that just ended, while it is still about this context. */
+  const fresh = (): Verdict | undefined =>
+    R.moment && R.moment.epoch === R.epoch && R.moment.turn === R.turns ? R.moment.verdict : undefined;
+
+  /**
+   * Past the notice line, a finished run whose request moved on hands off
+   * early: the old context would otherwise ride on every later turn until the
+   * warning line. Below the notice line nothing is asked at all.
+   */
+  const handoffIfMovedOn = (ctx: ExtensionContext): void => {
+    if (R.level !== 'notice' || fresh() !== 'moved_on' || R.movedOnAsked === R.epoch) return;
+    R.movedOnAsked = R.epoch;
+    requestHandoff(ctx, true, true);
+  };
+
+  /**
+   * After a turn, between the notice line and the hard cutoff: one Jev call,
+   * never awaited. The verdict lands on the next request or, when the run has
+   * already ended, acts then. No key, a timeout or an error: nothing changes.
+   */
+  const judge = (ctx: ExtensionContext): void => {
+    if (!active() || pending() || R.state.locked || R.judging || (R.level !== 'notice' && R.level !== 'warning')) return;
+    const state = (() => {
+      try { return compactable(ctx) ? momentState(ctx.sessionManager.getBranch() as unknown as Parameters<typeof momentState>[0]) : undefined; } catch { return undefined; }
+    })();
+    if (!state) return;
+    R.jev ??= (options.jev ?? connectJev)();
+    R.judging = true;
+    const epoch = R.epoch;
+    const turn = R.turns;
+    void R.jev
+      .then(jev => jev ? jev(state, MOMENT_QUESTIONS) : undefined)
+      .then(answers => {
+        const verdict = answers ? verdictOf(answers) : undefined;
+        if (!verdict || !R.alive || epoch !== R.epoch) return;
+        R.moment = { epoch, turn, verdict };
+        if (turn === R.turns && ctx.isIdle()) handoffIfMovedOn(ctx);
+      })
+      .catch(() => undefined)
+      .finally(() => { R.judging = false; });
   };
 
   const usageView = (ctx: ExtensionContext) => {
@@ -393,9 +448,10 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
   });
 
   pi.registerMessageRenderer(GUIDANCE_TYPE, (message, options, theme) => {
-    const details = message.details as { level?: Level; percent?: number | null } | undefined;
+    const details = message.details as { level?: Level; percent?: number | null; movedOn?: boolean } | undefined;
     const level = details?.level ?? 'warning';
-    const line = theme.fg(toneOf(level), `self-compact · ${levelTag(level)} at ${formatPct(details?.percent)} · asked the agent to write its note and compact`);
+    const why = details?.movedOn ? ' · the task moved on' : '';
+    const line = theme.fg(toneOf(level), `self-compact · ${levelTag(level)} at ${formatPct(details?.percent)}${why} · asked the agent to write its note and compact`);
     const content = typeof message.content === 'string' ? message.content : '';
     return new Text(options.expanded ? `${line}\n${theme.fg('dim', content)}` : line, options.outputPad ?? 1, 0);
   });
@@ -478,7 +534,10 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
       }
     })();
     if (!text) return undefined;
-    return { messages: [...event.messages, { role: 'custom' as const, customType: GUIDANCE_TYPE, content: text, display: false, timestamp: Date.now() }] };
+    // At the warning line a clean checkpoint is worth saying out loud; elsewhere the guidance is unchanged.
+    const moment = level === 'warning' ? momentLine(fresh()) : undefined;
+    const content = moment ? `${text}\n\n${moment}` : text;
+    return { messages: [...event.messages, { role: 'custom' as const, customType: GUIDANCE_TYPE, content, display: false, timestamp: Date.now() }] };
   });
 
   // Runs after every `context` handler, so the snapshot matches the request byte for byte
@@ -535,18 +594,26 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
     return { block: true, reason: `Tool "${event.toolName}" is blocked by self-compact: ${why}. Every tool except ${SELF_COMPACT_TOOL} is blocked until compaction succeeds. Write your note_to_self and call ${SELF_COMPACT_TOOL} now.` };
   });
 
-  pi.on('turn_end', async (_event, ctx) => { track(ctx); });
+  pi.on('turn_end', async (_event, ctx) => {
+    R.turns += 1;
+    track(ctx);
+    judge(ctx);
+  });
 
   pi.on('agent_end', async (_event, ctx) => {
     track(ctx);
     // The run stopped at or past the warning line: a clean checkpoint, so hand off now.
     requestHandoff(ctx, true);
+    // Or before it, when Jev already said the work moved on (a verdict still in flight acts on arrival).
+    handoffIfMovedOn(ctx);
   });
 
   pi.on('agent_settled', async (_event, ctx) => {
     if (!R.alive) return;
     refresh(ctx);
     const handoff = R.state.handoff;
+    // A verdict that landed while the run was winding down acts now that it is idle.
+    if (active() && !pending() && ctx.isIdle()) handoffIfMovedOn(ctx);
     if (!active() || !handoff || !ctx.isIdle()) return;
     if (handoff.status === 'ready') deliver(ctx);
     else if (handoff.status === 'pending') startCompaction(ctx, 'agent idle');

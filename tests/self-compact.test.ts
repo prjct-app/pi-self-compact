@@ -9,9 +9,12 @@ import { BUILTIN_PROMPTS, loadPrompt, renderTemplate } from '../src/prompts.ts';
 import { HANDOFF_TYPE, recoverState, STATE_TYPE, type EntryLike } from '../src/state.ts';
 import { cachedSummaryBlocker, extendPayload, replaceInstructions, summaryInputs } from '../src/summary.ts';
 import { levelFor, loadThresholdFile, parseSpec, resolveThresholds, DEFAULT_SPECS } from '../src/thresholds.ts';
+import { momentLine, momentState, verdictOf } from '../src/moment.ts';
 
 // keepRecentTokens reads Pi settings; never let the developer's own settings leak in.
 process.env.PI_CODING_AGENT_DIR = await mkdtemp(join(tmpdir(), 'pi-memory-sc-agent-'));
+// Nor the developer's TypeSafe key: Jev is absent unless a test injects one.
+process.env.PI_SELF_COMPACT_OFFLINE = '1';
 
 test('threshold specs accept tokens, k/m suffixes and percentages', () => {
   assert.deepEqual(parseSpec('270000', 'x'), { kind: 'tokens', value: 270_000, raw: '270000' });
@@ -430,4 +433,98 @@ test('split-turn summaries are recognized in the Pi 0.85 and 0.87 formats', () =
   }
   const unknown: any = { messages: [{ role: 'user', content: [{ type: 'text', text: 'something else' }], timestamp: 0 }] };
   assert.throws(() => replaceInstructions(unknown, inputs, 'OURS', 1_000_000), /Unrecognized Pi summary input/);
+});
+
+const answers = (switched: number, boundary: number, busy: number) => ({
+  switched_gears: { type: 'noul' as const, noul: switched },
+  at_boundary: { type: 'noul' as const, noul: boundary },
+  mid_operation: { type: 'noul' as const, noul: busy },
+});
+
+test('the moment: a half-done edit always holds; a finished turn is clean, or moved on when the request changed', () => {
+  assert.equal(verdictOf(answers(0.95, 0.9, 0.7)), 'busy');
+  assert.equal(verdictOf(answers(0.95, 0.9, 0.1)), 'moved_on');
+  assert.equal(verdictOf(answers(0.2, 0.9, 0.1)), 'clean');
+  assert.equal(verdictOf(answers(0.95, 0.4, 0.1)), 'continuing', 'a new request still in progress is not a checkpoint');
+  assert.equal(verdictOf({}), undefined);
+  assert.match(momentLine('clean') ?? '', /clean checkpoint/);
+  assert.equal(momentLine('busy'), undefined);
+  assert.equal(momentLine(undefined), undefined);
+});
+
+test('the moment reads requests since the last compaction and the last turn, never tool results', () => {
+  const message = (role: string, content: unknown) => ({ type: 'message', message: { role, content } });
+  const branch = [
+    message('user', 'old task before compaction'),
+    { type: 'compaction' },
+    message('user', 'Fix the proration rounding'),
+    message('assistant', [{ type: 'toolCall', name: 'read' }]),
+    message('toolResult', [{ type: 'text', text: 'SECRET FILE BODY' }]),
+    message('assistant', [{ type: 'text', text: 'Fixed; tests pass.' }]),
+    message('user', 'Now write the release notes'),
+    message('assistant', [{ type: 'toolCall', name: 'write' }, { type: 'text', text: 'Draft written.' }]),
+  ];
+  const state = momentState(branch);
+  assert.deepEqual(state, {
+    current_request: 'Now write the release notes',
+    previous_requests: ['Fix the proration rounding'],
+    recent_turn: 'Draft written.',
+    tools_this_turn: ['write'],
+  });
+  assert.equal(JSON.stringify(state).includes('SECRET'), false);
+  assert.equal(momentState([message('user', 'only one request')]), undefined, 'nothing to move on from yet');
+});
+
+test('Jev asks nothing below the notice line, and a finished run that moved on hands off early', async t => {
+  const cwd = await mkdtemp(join(tmpdir(), 'pi-self-compact-jev-'));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const h = host(cwd);
+  const calls = { value: 0 };
+  installSelfCompact(h.pi, { jev: async () => async () => { calls.value += 1; return answers(0.95, 0.9, 0.05); } });
+  await h.emit('session_start', { reason: 'startup' });
+  const requests = () => h.sent.filter(item => item.message.customType === 'self-compact-guidance');
+
+  h.gauge.tokens = 90_000;
+  await h.emit('turn_end');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(calls.value, 0, 'below the notice line Jev is never asked');
+
+  h.gauge.tokens = 110_000;
+  h.gauge.idle = false;
+  await h.emit('turn_end');
+  await h.emit('agent_end');
+  h.gauge.idle = true;
+  await new Promise(resolve => setTimeout(resolve, 20));
+  await h.emit('agent_settled');
+  await h.emit('agent_settled');
+  assert.equal(calls.value, 1);
+  assert.equal(requests().length, 1, 'the verdict acted once the run was idle, and only once');
+  assert.equal(requests()[0]?.message.details.movedOn, true);
+  assert.equal(requests()[0]?.message.details.level, 'notice');
+  await h.emit('session_shutdown');
+});
+
+test('at the warning line a clean checkpoint is said out loud; without Jev the guidance is unchanged', async t => {
+  const cwd = await mkdtemp(join(tmpdir(), 'pi-self-compact-jev-'));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const guidanceOf = async (jev?: () => Promise<any>) => {
+    const h = host(cwd);
+    installSelfCompact(h.pi, jev ? { jev } : {});
+    await h.emit('session_start', { reason: 'startup' });
+    h.gauge.tokens = 155_000;
+    h.gauge.idle = false;
+    await h.emit('turn_end');
+    await new Promise(resolve => setTimeout(resolve, 20));
+    const [result] = await h.emit('context', { messages: [] });
+    await h.emit('session_shutdown');
+    return String(result?.messages?.at(-1)?.content ?? '');
+  };
+  const plain = await guidanceOf();
+  assert.ok(plain.length > 0);
+  assert.doesNotMatch(plain, /clean checkpoint/);
+  const clean = await guidanceOf(async () => async () => answers(0.2, 0.9, 0.05));
+  assert.ok(clean.startsWith(plain), 'the line is added, nothing else changes');
+  assert.match(clean, /clean checkpoint/);
+  const failing = await guidanceOf(async () => async () => { throw new Error('timeout'); });
+  assert.equal(failing, plain, 'a Jev failure changes nothing');
 });
