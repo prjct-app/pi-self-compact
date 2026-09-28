@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- With a TypeSafe key, Jev judges the moment after each turn past the notice line (task switched, unit finished, edit half done), without waiting on it. A finished run that moved on hands off early; at the warning line a clean checkpoint is told to compact now. A half-done edit never triggers anything; no key or any error keeps the token lines alone.
 - `thresholds.json` in `.pi/self-compact/` (project) or `~/.pi/agent/self-compact/` (global) sets persistent lines; flags still win. A bad file disables self-compact with the reason, and `/self-compact` shows where the lines came from.
 - The global override directory follows `PI_CODING_AGENT_DIR`.
 - The summary extends the last session request (same provider body, same session id, one extra message) instead of replaying the history as text, so the provider bills the shared prefix as cached input. Measured on Codex: 48,000 of 49,417 input tokens cached, against 0 before. Falls back to the replayed summary on overflow, a model change, a stale snapshot or an error. List `pi-self-compact` last in `packages` so it sees the body after other extensions rewrite it.

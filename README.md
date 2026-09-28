@@ -40,6 +40,14 @@ Any key can be left out. A file that does not parse, or has an unknown key, disa
 
 Nobody has to prompt it. When a run stops at or past the warning line (a finished turn, or a session resumed there), the extension asks the agent to write its note and compact, at most twice per cycle so an agent that ignores it cannot loop. Each crossing and each handoff prints one line in the transcript; expand it to see the exact guidance or note the model receives.
 
+### The moment (Jev)
+
+Token lines say how full the context is, not whether now is a good time. With a TypeSafe key (`TYPESAFE_API_KEY`, or the OS keyring entry pi-qa and pi-memory share), each turn that ends between the notice line and the hard cutoff asks [Jev](https://typesafe.ai) three yes/no questions in one call: did the request switch tasks, did the last turn finish a unit of work, is a multi-step edit half done. The call is never awaited and reads only the requests and the last turn's prose, never tool results.
+
+- Past the notice line, a finished run whose request moved on is asked to hand off right away instead of carrying the old work to the warning line. Once per context.
+- At the warning line, a clean checkpoint adds one sentence to the guidance: compact now, before the hard cutoff lands in the middle of an edit.
+- A half-done edit never triggers anything. Below the notice line, without a key, or on any Jev error, self-compact runs on its token lines alone.
+
 A failed summary keeps the note and the lock and retries (up to three times, then `/self-compact now` or `/compact`). Reload, resume and `/tree` rebuild the handoff from the session journal. Automatic compaction is left alone: with pi-memory installed it stays cancelled; a plain `/compact` keeps Pi's prompt.
 
 ## Commands and tools
