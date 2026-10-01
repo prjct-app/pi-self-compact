@@ -166,8 +166,7 @@ test('a full cycle: guidance, forced lock, note, compaction, verbatim return, un
   const [blocked] = await h.emit('tool_call', { toolName: 'bash', toolCallId: 't2', input: {} });
   assert.equal(blocked.block, true);
   assert.match(blocked.reason, /self_compact/);
-  const [usage] = await h.emit('tool_call', { toolName: 'context_usage', toolCallId: 't3', input: {} });
-  assert.equal(usage, undefined, 'the gauge stays readable while locked');
+  assert.equal(h.tools.has('context_usage'), false, 'the gauge is not a tool: the guidance messages carry the numbers');
 
   const note = '  Goal: ship.\nDONE: a.ts\nNEXT ACTION: run npm test  ';
   const saved = await h.tools.get('self_compact').execute('c1', { note_to_self: note }, undefined, undefined, h.ctx);

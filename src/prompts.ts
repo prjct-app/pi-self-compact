@@ -11,7 +11,8 @@ import { join } from 'node:path';
  * placeholders take the live values listed in TemplateValues.
  */
 
-export const NOTE_MAX_CHARS = 24_000;
+/** p95 of real notes is 11.2k chars; at 24k a note could cost as much as the work it summarized. */
+export const NOTE_MAX_CHARS = 12_000;
 
 export type PromptKey = 'soft' | 'warning' | 'forced' | 'summary';
 
@@ -32,7 +33,7 @@ const WARNING = `[self-compact · WARNING] Context is {{used_tokens}} tokens ({{
 
 Finish only the current atomic step, then write your \`note_to_self\` (max {{note_max_chars}} chars: goal, DONE with exact paths and commands, IN PROGRESS, key decisions, verified test results, the exact NEXT ACTION last) and call \`self_compact\` as your only tool call. Do not list finished work as pending.`;
 
-const FORCED = `[self-compact · FORCED] Context is {{used_tokens}} tokens ({{used_percent}}), at or past the hard cutoff of {{forced_tokens}}. Every tool except \`self_compact\` and \`context_usage\` is blocked.
+const FORCED = `[self-compact · FORCED] Context is {{used_tokens}} tokens ({{used_percent}}), at or past the hard cutoff of {{forced_tokens}}. Every tool except \`self_compact\` is blocked.
 
 Write your \`note_to_self\` now (max {{note_max_chars}} chars: goal, DONE with exact paths and commands, IN PROGRESS, key decisions, verified test results, the exact NEXT ACTION last) and call \`self_compact\` as your only tool call.`;
 
@@ -108,4 +109,4 @@ export const compactNowPrompt = (saved?: string): string => {
 };
 
 /** Static, so the system-prompt cache prefix never changes between calls. */
-export const SYSTEM_POLICY = 'self-compact: when context usage crosses a threshold you receive a transient [self-compact · …] message with live numbers. Call context_usage (no arguments) when you need the current numbers; do not poll it every turn. After a compaction your saved note_to_self is returned verbatim as the next message: resume its NEXT ACTION without waiting for the user and never redo work the note marks as done. If no work remains, report completion and stop.';
+export const SYSTEM_POLICY = 'self-compact: when context usage crosses a threshold you receive a transient [self-compact · …] message with live numbers. After a compaction your saved note_to_self is returned verbatim as the next message: resume its NEXT ACTION without waiting for the user and never redo work the note marks as done. If no work remains, report completion and stop.';
