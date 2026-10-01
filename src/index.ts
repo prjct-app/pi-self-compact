@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import { Container, Text } from '@earendil-works/pi-tui';
 import { Type } from 'typebox';
-import { brand, completer, row, SYMBOL } from '@prjct.app/pi-tui-kit';
+import { brand, completer, row, SYMBOL, repairToolArgs } from '@prjct.app/pi-tui-kit';
 import {
   compactNowPrompt, loadPrompt, NOTE_MAX_CHARS, promptDirs, renderTemplate, SYSTEM_POLICY, type TemplateValues,
 } from './prompts.ts';
@@ -30,7 +30,7 @@ import { MOMENT_QUESTIONS, momentLine, momentState, verdictOf, type Verdict } fr
  * - notice / warning: a transient guidance message rides on each request (the
  *   `context` hook) and is never persisted. Load this package after pi-memory
  *   so the guidance lands after its bounded history.
- * - forced: every tool except self_compact and context_usage is blocked in
+ * - forced: every tool except self_compact is blocked in
  *   `tool_call`; the active tool list is never narrowed, because Pi would
  *   answer "tool not found" before any hook could explain why.
  * - self_compact ends the run, compaction starts once Pi is idle, and the note
@@ -44,7 +44,6 @@ import { MOMENT_QUESTIONS, momentLine, momentState, verdictOf, type Verdict } fr
  */
 
 export const SELF_COMPACT_TOOL = 'self_compact';
-export const CONTEXT_USAGE_TOOL = 'context_usage';
 const STATUS_KEY = 'self-compact';
 const MAX_AUTO_RETRIES = 3;
 const SUMMARY_ATTEMPTS = 2;
@@ -84,6 +83,7 @@ const handoffTag = (status: Handoff['status']): string =>
   status === 'failed' ? 'COMPACTION FAILED' : status === 'ready' ? 'COMPACTED' : 'COMPACTING';
 
 export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions = {}): SelfCompactController | undefined => {
+  repairToolArgs(pi);
   // Subagent children run bounded, delegated work; their parent owns compaction.
   if (options.enabled === false || process.env.PI_SUBAGENTS_CHILD === '1') return undefined;
 
@@ -333,53 +333,13 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
       .finally(() => { R.judging = false; });
   };
 
-  const usageView = (ctx: ExtensionContext) => {
-    refresh(ctx);
-    const t = R.thresholds;
-    const tokens = R.usage.tokens;
-    const round = (value: number | null | undefined): number | null =>
-      value === null || value === undefined || !Number.isFinite(value) ? null : Number(value.toFixed(1));
-    const handoff = pending();
-    return {
-      used_tokens: tokens, used_percent: round(R.usage.percent), context_window: R.usage.window, level: R.level,
-      thresholds: t ? {
-        notice: { tokens: t.softTokens, percent: round(t.softPct) },
-        warning: { tokens: t.warnTokens, percent: round(t.warnPct) },
-        hard_cutoff: { tokens: t.forcedTokens, percent: round(t.forcedPct) },
-      } : null,
-      tokens_until_warning: t && tokens !== null ? Math.max(0, t.warnTokens - tokens) : null,
-      tokens_until_hard_cutoff: t && tokens !== null ? Math.max(0, t.forcedTokens - tokens) : null,
-      tools_locked: R.state.locked,
-      pending_note: handoff ? { status: handoff.status, chars: handoff.note.length } : null,
-      compaction_cycles: R.state.cycle,
-      settings_error: R.error ?? null,
-    };
-  };
-
-  pi.registerTool({
-    name: CONTEXT_USAGE_TOOL,
-    label: 'Context Usage',
-    description: `${SYSTEM_POLICY}\n\nYour own context usage as JSON: used tokens and percent, the window, the self-compact level, the notice, warning and hard-cutoff lines, and the tokens left before each. You cannot see these numbers otherwise. Call it when deciding something (after a compaction, before a large read, when judging whether to call ${SELF_COMPACT_TOOL}); a message arrives on its own when a line is crossed.`,
-    promptSnippet: 'Show your context usage and the self-compact thresholds as JSON',
-    parameters: Type.Object({}, { additionalProperties: false }),
-    async execute(_id, _params, _signal, _onUpdate, ctx) {
-      const view = usageView(ctx);
-      return { content: [{ type: 'text', text: JSON.stringify(view, null, 2) }], details: view };
-    },
-    renderCall(_args, theme, context) {
-      return context?.isPartial !== false ? row(theme, { symbol: SYMBOL.active, tone: 'accent', verb: 'CTX', target: 'usage', meta: 'reading…' }) : new Container();
-    },
-    renderResult(result, _options, theme) {
-      const view = result.details as ReturnType<typeof usageView> | undefined;
-      const meta = view ? `${view.used_tokens?.toLocaleString('en-US') ?? '?'} tokens · ${view.used_percent ?? '?'}% · ${view.level}` : '';
-      return row(theme, { symbol: SYMBOL.ok, tone: 'success', verb: 'CTX', target: 'usage', meta });
-    },
-  });
+  // The gauge is no longer a tool: 254 tokens on every request for numbers the
+  // [self-compact · …] messages already carry. /self-compact status shows it to the person.
 
   pi.registerTool({
     name: SELF_COMPACT_TOOL,
     label: 'Self Compact',
-    description: `Hand off to yourself across a context compaction. note_to_self (1-${NOTE_MAX_CHARS} chars) holds the goal, DONE work with exact file paths and commands, IN PROGRESS state, key decisions, verified test results, and the exact NEXT ACTION as the last line. Call it alone in a tool batch: the note is saved, this run ends, the context is compacted once you are idle, and the note is returned verbatim so you continue from NEXT ACTION. At the hard cutoff every other tool is blocked until this succeeds.`,
+    description: `Hand off to yourself across a context compaction. note_to_self (1-${NOTE_MAX_CHARS} chars) holds the goal, DONE work with exact paths and commands, IN PROGRESS state, key decisions, verified results, and the exact NEXT ACTION as the last line. Call it alone in a tool batch; the context is compacted and the note returns verbatim as the next message: resume its NEXT ACTION without waiting and never redo what it marks done. [self-compact · …] messages carry the live numbers. At the hard cutoff every other tool is blocked until this succeeds.`,
     promptSnippet: 'Compact your own context: save a note_to_self; after compaction the note comes back verbatim',
     promptGuidelines: [
       // An open invitation made every model compact at the notice line, a few
@@ -526,7 +486,7 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
 
   pi.on('before_agent_start', async (event, ctx) => {
     track(ctx);
-    // The policy rides on the context_usage tool description: a per-turn system
+    // The policy rides on the self_compact tool description: a per-turn system
     // prompt is dropped on automated turns and flipped the cached prefix.
     return undefined;
   });
@@ -590,7 +550,7 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
 
   pi.on('tool_call', async (event, ctx) => {
     track(ctx);
-    if (!active() || event.toolName === SELF_COMPACT_TOOL || event.toolName === CONTEXT_USAGE_TOOL) return undefined;
+    if (!active() || event.toolName === SELF_COMPACT_TOOL) return undefined;
     // Pi preflights a batch sequentially before running it, so a sibling of
     // self_compact in the same assistant message is blocked and ends the run.
     const branch = ctx.sessionManager.getBranch();

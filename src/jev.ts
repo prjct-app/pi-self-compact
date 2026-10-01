@@ -1,4 +1,4 @@
-import { KEYRING_ACCOUNT, KEYRING_SERVICE, keyringStoreFromEntries, resolveKey } from '@prjct.app/pi-tui-kit';
+import { KEYRING_ACCOUNT, KEYRING_SERVICE, keyringStoreFromEntries, resolveKey, JEV_MODEL } from '@prjct.app/pi-tui-kit';
 import type { Questions } from '@typesafe-ai/sdk';
 
 /**
@@ -13,7 +13,7 @@ export type Jev = (state: unknown, questions: Questions, signal?: AbortSignal) =
 export type ConnectJev = () => Promise<Jev | undefined>;
 
 /** Pinned like pi-qa and pi-memory: a silent model swap would move every threshold. */
-export const JEV_MODEL = 'jev-1.13.0';
+export { JEV_MODEL };
 const TIMEOUT_MS = 8_000;
 
 /** The one TypeSafe key every prjct extension shares: TYPESAFE_API_KEY, then the OS keyring. */
