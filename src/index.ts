@@ -575,6 +575,9 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
     if (R.snapshot) R.snapshot = { ...R.snapshot, tail: [...R.snapshot.tail, event.message] };
     if (event.message.role === 'assistant') {
       track(ctx);
+      // A reply after the note was saved means something woke the agent before
+      // compaction ran; what woke it is journaled by now, so compact instead of waiting for idle.
+      if (R.state.handoff?.status === 'pending' && active()) defer('woken', 0, () => startCompaction(ctx, 'woken with a saved note'));
       return;
     }
     const handoff = R.state.handoff;
@@ -606,9 +609,17 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
       save({ handoff: { ...handoff, status: 'done' }, locked: false });
       return undefined;
     }
-    const why = handoff?.status === 'pending' || handoff?.status === 'compacting'
-      ? `a ${SELF_COMPACT_TOOL} note is saved and compaction is ${handoff.status}`
-      : handoff?.status === 'failed'
+    // A note is saved but something woke the agent first (a teammate, a subagent,
+    // a job), so the idle moment compaction waits for may never come: each wake
+    // meets blocked tools and saves the note again. Compact now; Pi stops this run first.
+    if (handoff?.status === 'pending') {
+      defer('woken', 0, () => startCompaction(ctx, 'woken with a saved note'));
+      return { block: true, terminate: true, reason: `Tool "${event.toolName}" is blocked: your ${SELF_COMPACT_TOOL} note is saved and compaction is starting now. Stop here; the note comes back verbatim after compaction, and whatever woke you is still in the conversation.` };
+    }
+    if (handoff?.status === 'compacting') {
+      return { block: true, terminate: true, reason: `Tool "${event.toolName}" is blocked: compaction is running with your saved ${SELF_COMPACT_TOOL} note. Stop here; the note comes back verbatim when it is done.` };
+    }
+    const why = handoff?.status === 'failed'
         ? `the last compaction failed (${handoff.error ?? 'unknown error'}) and the saved note is kept`
         : `context is at ${formatPct(R.usage.percent)} (${R.usage.tokens?.toLocaleString('en-US') ?? '?'} tokens), past the hard cutoff of ${R.thresholds?.forcedTokens.toLocaleString('en-US') ?? '?'} tokens`;
     return { block: true, reason: `Tool "${event.toolName}" is blocked by self-compact: ${why}. Every tool except ${SELF_COMPACT_TOOL} is blocked until compaction succeeds. Write your note_to_self and call ${SELF_COMPACT_TOOL} now.` };

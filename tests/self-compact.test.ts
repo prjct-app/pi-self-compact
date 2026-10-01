@@ -191,6 +191,44 @@ test('a full cycle: guidance, forced lock, note, compaction, verbatim return, un
   assert.match(controller.describe(h.ctx).join('\n'), /cycles 1/);
 });
 
+test('a saved note compacts as soon as something wakes the agent, without waiting for idle', async t => {
+  const cwd = await mkdtemp(join(tmpdir(), 'pi-memory-sc-woken-'));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const h = host(cwd);
+  installSelfCompact(h.pi);
+  await h.emit('session_start', { reason: 'startup' });
+  h.gauge.tokens = 185_000;
+  await h.tools.get('self_compact').execute('c1', { note_to_self: 'Goal: ship.\nNEXT ACTION: npm test' }, undefined, undefined, h.ctx);
+  // A teammate's message or a subagent's question keeps Pi busy: agent_settled never comes.
+  h.gauge.idle = false;
+  await h.emit('message_end', { message: { role: 'assistant', content: [{ type: 'text', text: 'Back. Resending.' }] } });
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(h.compactions.length, 1, 'the woken reply starts compaction');
+  const [blocked] = await h.emit('tool_call', { toolName: 'team_message', toolCallId: 't1', input: {} });
+  assert.equal(blocked.block, true);
+  assert.equal(blocked.terminate, true, 'the run stops instead of looping on blocked tools');
+  assert.match(blocked.reason, /compaction is running/);
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(h.compactions.length, 1, 'one compaction, not one per wake');
+});
+
+test('a tool call that meets a saved note starts compaction and ends the run', async t => {
+  const cwd = await mkdtemp(join(tmpdir(), 'pi-memory-sc-woken-tool-'));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const h = host(cwd);
+  installSelfCompact(h.pi);
+  await h.emit('session_start', { reason: 'startup' });
+  h.gauge.tokens = 185_000;
+  await h.tools.get('self_compact').execute('c1', { note_to_self: 'Goal: ship.\nNEXT ACTION: npm test' }, undefined, undefined, h.ctx);
+  h.gauge.idle = false;
+  const [blocked] = await h.emit('tool_call', { toolName: 'bash', toolCallId: 't1', input: {} });
+  assert.equal(blocked.block, true);
+  assert.equal(blocked.terminate, true);
+  assert.match(blocked.reason, /compaction is starting now/);
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(h.compactions.length, 1);
+});
+
 test('the summary extends the cached session request instead of replaying it as text', async t => {
   const cwd = await mkdtemp(join(tmpdir(), 'pi-memory-sc-cached-'));
   t.after(() => rm(cwd, { recursive: true, force: true }));
