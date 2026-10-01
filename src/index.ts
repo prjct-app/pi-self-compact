@@ -14,10 +14,11 @@ import {
   cachedSummaryBlocker, generateCachedSummary, generateSummary, hasCompactionMaterial, keepRecentTokens, modelKey, type RequestSnapshot,
 } from './summary.ts';
 import {
-  DEFAULT_SPECS, formatPct, LEVEL_ORDER, levelFor, loadThresholdFile, resolveThresholds, SPEC_HELP,
+  DEFAULT_SPECS, formatPct, LEVEL_ORDER, levelFor, loadThresholdFile, parseSpec, resolveThresholds, SPEC_HELP,
   type Level, type ThresholdSpecs, type Thresholds,
 } from './thresholds.ts';
 import { connectJev, type ConnectJev, type Jev } from './jev.ts';
+import { CLEAR_DEFAULTS, clearLine, planClear, type ClearSettings, type ProjectedEntryLike } from './clear.ts';
 import { MOMENT_QUESTIONS, momentLine, momentState, verdictOf, type Verdict } from './moment.ts';
 
 /**
@@ -37,6 +38,9 @@ import { MOMENT_QUESTIONS, momentLine, momentState, verdictOf, type Verdict } fr
  *   whatever else is installed (pi-memory cancels it); this is always an
  *   explicit, visible compaction.
  * - The state is journaled, so reload, resume and /tree rebuild the handoff.
+ * - Before any of that, stale tool I/O is cleared in batches through Pi's
+ *   context edits (see clear.ts), so compaction is left for what clearing
+ *   cannot reach.
  */
 
 export const SELF_COMPACT_TOOL = 'self_compact';
@@ -44,6 +48,8 @@ export const CONTEXT_USAGE_TOOL = 'context_usage';
 const STATUS_KEY = 'self-compact';
 const MAX_AUTO_RETRIES = 3;
 const SUMMARY_ATTEMPTS = 2;
+/** Pi's answer when the branch has nothing past keepRecentTokens: retrying cannot help. */
+const NOTHING_TO_COMPACT = /nothing to compact/iu;
 /** Unprompted handoff requests per context epoch, so an agent that ignores them cannot loop. */
 const MAX_AUTO_REQUESTS = 2;
 
@@ -55,9 +61,14 @@ export type SelfCompactOptions = Readonly<{
   promptDirs?: readonly string[];
   /** Injected by the tests; the real one reads the shared TypeSafe key. */
   jev?: ConnectJev;
+  /** Clearing of stale tool I/O; CLI flags override it. */
+  clear?: Partial<ClearSettings>;
 }>;
 
 type Usage = Readonly<{ tokens: number | null; percent: number | null; window: number }>;
+
+/** The part of Pi 0.87's turn_end boundary state clearing reads: proposed entries and the projected context. */
+type BoundaryEvent = Readonly<{ entries?: readonly unknown[]; context?: Readonly<{ contextEntries?: readonly ProjectedEntryLike[] }> }>;
 
 export type SelfCompactController = Readonly<{
   /** Ask the agent to write its note and compact now (reuses a saved note). */
@@ -81,6 +92,7 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
   pi.registerFlag('compact-buffer', { description: `Allowance above --compact-at before other tools are blocked (default ${DEFAULT_SPECS.buffer}; 0 blocks at the warning).`, type: 'string' });
   pi.registerFlag('compact-prompt', { description: 'Literal text that replaces the self-compact summary system prompt.', type: 'string' });
   pi.registerFlag('no-self-compact', { description: 'Disable self-compact for this session.', type: 'boolean' });
+  pi.registerFlag('context-clear-at', { description: `Clear stale tool I/O once the context reaches this many tokens (default ${CLEAR_DEFAULTS.atTokens / 1000}k, 0 turns it off). ${SPEC_HELP}`, type: 'string' });
 
   const R = {
     disabled: false,
@@ -118,6 +130,8 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
     judging: false,
     /** The epoch an early handoff was already asked in: once per context is enough. */
     movedOnAsked: -1,
+    /** Tokens freed and batches applied by clearing, this runtime. */
+    cleared: { tokens: 0, batches: 0 },
   };
 
   const flag = (name: string): string | undefined => {
@@ -368,7 +382,9 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
     description: `Hand off to yourself across a context compaction. note_to_self (1-${NOTE_MAX_CHARS} chars) holds the goal, DONE work with exact file paths and commands, IN PROGRESS state, key decisions, verified test results, and the exact NEXT ACTION as the last line. Call it alone in a tool batch: the note is saved, this run ends, the context is compacted once you are idle, and the note is returned verbatim so you continue from NEXT ACTION. At the hard cutoff every other tool is blocked until this succeeds.`,
     promptSnippet: 'Compact your own context: save a note_to_self; after compaction the note comes back verbatim',
     promptGuidelines: [
-      `Call ${SELF_COMPACT_TOOL} alone in a tool batch when a [self-compact · …] message asks you to, or at a clean checkpoint when context is high.`,
+      // An open invitation made every model compact at the notice line, a few
+      // requests past it: a compaction every ~120k tokens instead of at the warning line.
+      `Call ${SELF_COMPACT_TOOL} alone in a tool batch only when a [self-compact · …] message asks you to call it now.`,
       `A ${SELF_COMPACT_TOOL} note_to_self ends with the exact NEXT ACTION and never lists finished work as pending.`,
     ],
     parameters: Type.Object({
@@ -388,10 +404,9 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
         refresh(ctx);
         throw new Error(`Nothing to compact yet: Pi keeps the newest ${keepRecentTokens(ctx.cwd).toLocaleString('en-US')} tokens untouched and this session does not reach past them (context ${R.usage.tokens?.toLocaleString('en-US') ?? '?'} tokens). No note was saved and no tool is blocked. Keep working.`);
       }
-      if (existing && existing.note.trim() !== raw.trim()) {
-        throw new Error(`A note is already saved (${existing.note.length} chars). Retry ${SELF_COMPACT_TOOL} with that saved note verbatim.`);
-      }
-      const note = existing ? existing.note : raw;
+      // A retry takes the fresh note: demanding the saved one verbatim looped
+      // models that cannot reproduce it byte for byte.
+      const note = raw;
       const handoff: Handoff = { id: existing?.id ?? randomUUID(), note, status: 'pending', attempts: 0, savedAt: Date.now() };
       R.lastError = undefined;
       save({ handoff, locked: true });
@@ -560,6 +575,9 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
     if (R.snapshot) R.snapshot = { ...R.snapshot, tail: [...R.snapshot.tail, event.message] };
     if (event.message.role === 'assistant') {
       track(ctx);
+      // A reply after the note was saved means something woke the agent before
+      // compaction ran; what woke it is journaled by now, so compact instead of waiting for idle.
+      if (R.state.handoff?.status === 'pending' && active()) defer('woken', 0, () => startCompaction(ctx, 'woken with a saved note'));
       return;
     }
     const handoff = R.state.handoff;
@@ -586,19 +604,77 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
     }
     if (!R.state.locked) return undefined;
     const handoff = R.state.handoff;
-    const why = handoff?.status === 'pending' || handoff?.status === 'compacting'
-      ? `a ${SELF_COMPACT_TOOL} note is saved and compaction is ${handoff.status}`
-      : handoff?.status === 'failed'
+    // Heals sessions already stuck on an uncompactable failure.
+    if (handoff?.status === 'failed' && NOTHING_TO_COMPACT.test(handoff.error ?? '')) {
+      save({ handoff: { ...handoff, status: 'done' }, locked: false });
+      return undefined;
+    }
+    // A note is saved but something woke the agent first (a teammate, a subagent,
+    // a job), so the idle moment compaction waits for may never come: each wake
+    // meets blocked tools and saves the note again. Compact now; Pi stops this run first.
+    if (handoff?.status === 'pending') {
+      defer('woken', 0, () => startCompaction(ctx, 'woken with a saved note'));
+      return { block: true, terminate: true, reason: `Tool "${event.toolName}" is blocked: your ${SELF_COMPACT_TOOL} note is saved and compaction is starting now. Stop here; the note comes back verbatim after compaction, and whatever woke you is still in the conversation.` };
+    }
+    if (handoff?.status === 'compacting') {
+      return { block: true, terminate: true, reason: `Tool "${event.toolName}" is blocked: compaction is running with your saved ${SELF_COMPACT_TOOL} note. Stop here; the note comes back verbatim when it is done.` };
+    }
+    const why = handoff?.status === 'failed'
         ? `the last compaction failed (${handoff.error ?? 'unknown error'}) and the saved note is kept`
         : `context is at ${formatPct(R.usage.percent)} (${R.usage.tokens?.toLocaleString('en-US') ?? '?'} tokens), past the hard cutoff of ${R.thresholds?.forcedTokens.toLocaleString('en-US') ?? '?'} tokens`;
     return { block: true, reason: `Tool "${event.toolName}" is blocked by self-compact: ${why}. Every tool except ${SELF_COMPACT_TOOL} is blocked until compaction succeeds. Write your note_to_self and call ${SELF_COMPACT_TOOL} now.` };
   });
 
-  pi.on('turn_end', async (_event, ctx) => {
-    R.turns += 1;
-    track(ctx);
-    judge(ctx);
-  });
+  /**
+   * The clearing settings in force: flag, then options, then defaults. A spec
+   * the flag cannot parse turns clearing off rather than guessing.
+   */
+  const clearSettings = (ctx: ExtensionContext): ClearSettings | undefined => {
+    const raw = flag('context-clear-at');
+    const at = (() => {
+      if (raw === undefined) return options.clear?.atTokens ?? CLEAR_DEFAULTS.atTokens;
+      try {
+        const spec = parseSpec(raw, '--context-clear-at');
+        return spec.kind === 'percent' ? Math.floor(spec.value / 100 * R.usage.window) : spec.value;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!R.promptErrors.has(message)) {
+          R.promptErrors.add(message);
+          notify(ctx, `self-compact: clearing off: ${message}`, 'warning');
+        }
+        return 0;
+      }
+    })();
+    if (at <= 0) return undefined;
+    return { ...CLEAR_DEFAULTS, ...options.clear, atTokens: clearLine(at, R.usage.window) };
+  };
+
+  /**
+   * Tier 1: once the context reaches the clearing line, stale tool I/O becomes
+   * stubs in one batch. From the warning line on, any amount is cleared, so a
+   * compaction only happens when clearing cannot bring the context back down.
+   */
+  const clearStale = (event: BoundaryEvent | undefined, ctx: ExtensionContext): { entries: readonly unknown[] } | undefined => {
+    const settings = clearSettings(ctx);
+    const tokens = R.usage.tokens;
+    const entries = event?.context?.contextEntries;
+    if (R.disabled || pending() || !settings || tokens === null || tokens < settings.atTokens || !entries) return undefined;
+    const forced = R.level === 'warning' || R.level === 'forced';
+    const plan = planClear(entries, settings);
+    if (plan.tokens < (forced ? settings.minTokens : settings.batchTokens)) return undefined;
+    R.cleared = { tokens: R.cleared.tokens + plan.tokens, batches: R.cleared.batches + 1 };
+    notify(ctx, `self-compact: cleared ~${plan.tokens.toLocaleString('en-US')} tokens of stale tool I/O (${plan.edits.length} items)`);
+    return { entries: [...(event?.entries ?? []), ...plan.edits] };
+  };
+
+  // Pi 0.87+ lets turn_end append entries (here, context edits); older hosts ignore the result.
+  (pi.on as (event: string, handler: (event: BoundaryEvent | undefined, ctx: ExtensionContext) => Promise<unknown>) => void)(
+    'turn_end', async (event, ctx) => {
+      R.turns += 1;
+      track(ctx);
+      judge(ctx);
+      return clearStale(event, ctx);
+    });
 
   pi.on('agent_end', async (_event, ctx) => {
     track(ctx);
@@ -706,8 +782,17 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
       return;
     }
     const ours = R.lastError !== undefined;
-    const failed: Handoff = { ...handoff, status: 'failed', attempts: handoff.attempts + 1,
-      error: R.lastError ?? event.errorMessage ?? (event.aborted ? 'compaction was cancelled' : 'compaction failed') };
+    const error = R.lastError ?? event.errorMessage ?? (event.aborted ? 'compaction was cancelled' : 'compaction failed');
+    // Pi found nothing to compact: no retry can succeed, so locking would strand
+    // the agent in a self_compact loop. Drop the note and hand the tools back.
+    if (NOTHING_TO_COMPACT.test(error)) {
+      R.lastError = undefined;
+      save({ handoff: { ...handoff, status: 'done', error }, locked: false });
+      refresh(ctx);
+      notify(ctx, `self-compact: ${error}. Note dropped, tools unlocked.`, 'warning');
+      return;
+    }
+    const failed: Handoff = { ...handoff, status: 'failed', attempts: handoff.attempts + 1, error };
     save({ handoff: failed, locked: true });
     refresh(ctx);
     if ((ours || !event.aborted) && failed.attempts < MAX_AUTO_RETRIES) {
@@ -741,6 +826,12 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
         `usage ${R.usage.tokens === null ? 'unknown' : `${fmt(R.usage.tokens)} tokens (${formatPct(R.usage.percent)})`} of ${fmt(R.usage.window)}`,
         t ? `lines notice ${fmt(t.softTokens)} · warning ${fmt(t.warnTokens)} · cutoff ${fmt(t.forcedTokens)}${t.clamped ? ' (clamped to window)' : ''} · from ${R.specSource}` : `lines ${R.specs.softAt} / ${R.specs.at} / +${R.specs.buffer} · from ${R.specSource}`,
         `level ${R.level} · tools ${R.state.locked ? 'LOCKED' : 'unlocked'} · cycles ${R.state.cycle}`,
+        (() => {
+          const settings = clearSettings(ctx);
+          return settings
+            ? `clearing at ${fmt(settings.atTokens)} · keeps the last ${settings.keepRequests} requests · cleared ${fmt(R.cleared.tokens)} tokens in ${R.cleared.batches} batches`
+            : 'clearing off';
+        })(),
         ...(handoff ? [`note ${handoff.status} · ${fmt(handoff.note.length)} chars${handoff.error ? ` · ${handoff.error}` : ''}`] : []),
       ];
     },

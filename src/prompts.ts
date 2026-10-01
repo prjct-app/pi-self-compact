@@ -26,7 +26,7 @@ export type TemplateValues = Readonly<Record<string, string | number>>;
 
 const SOFT = `[self-compact · notice] Heads-up only. Context is {{used_tokens}} tokens ({{used_percent}}) of a {{context_window}}-token window, past the notice line of {{soft_tokens}}. Nothing is blocked and nothing is required. Keep working.
 
-The warning line is at {{warning_tokens}} tokens and the hard cutoff at {{forced_tokens}}, {{remaining_to_forced}} tokens away. You decide when to compact: at a clean checkpoint, \`self_compact\` takes a \`note_to_self\` (up to {{note_max_chars}} chars) that is handed back to you verbatim after the compaction.`;
+The warning line is at {{warning_tokens}} tokens and the hard cutoff at {{forced_tokens}}, {{remaining_to_forced}} tokens away. Do not call \`self_compact\` yet: a message tells you when it is time.`;
 
 const WARNING = `[self-compact · WARNING] Context is {{used_tokens}} tokens ({{used_percent}}) of {{context_window}}, past the warning line of {{warning_tokens}}. Time to compact soon: {{remaining_to_forced}} tokens left before every tool except \`self_compact\` is blocked.
 
