@@ -1,10 +1,18 @@
 # @prjct.app/pi-self-compact
 
+[![pi-self-compact — for PI Agent](https://raw.githubusercontent.com/prjct-app/pi-self-compact/main/docs/cover.png)](https://pi.dev)
+
 A Pi extension for long, autonomous runs. The agent watches its own context, writes a `note_to_self` at a clean checkpoint, the session is compacted, and the exact note comes back as the next message, so the run continues without a human.
 
 Adapted from [disler/self-compact-pi-agent](https://github.com/disler/self-compact-pi-agent) (MIT); see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Install
+
+```sh
+pi install npm:@prjct.app/pi-self-compact
+```
+
+When using pi-memory, keep pi-self-compact after it in the package list.
 
 For the local checkout used by this workspace:
 
@@ -60,7 +68,7 @@ A failed summary keeps the note and the lock and retries (up to three times, the
 | `context_usage()` | the agent's own gauge as JSON |
 | `self_compact(note_to_self)` | the handoff |
 
-The footer belongs to p-ui; the phase is published as the `self-compact` extension status (`ctx 55.1% WARNING`). Subagent children (`PI_SUBAGENTS_CHILD=1`) never install the extension.
+The footer belongs to pi-ui; the phase is published as the `self-compact` extension status (`ctx 55.1% WARNING`). Subagent children (`PI_SUBAGENTS_CHILD=1`) never install the extension.
 
 ## Prompts
 

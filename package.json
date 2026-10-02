@@ -1,11 +1,16 @@
 {
   "name": "@prjct.app/pi-self-compact",
-  "version": "0.2.1",
-    "description": "Pi extension: the agent watches its own context, writes a note_to_self at a clean checkpoint, compacts, and continues from the note verbatim.",
+  "version": "0.2.2",
+  "description": "Pi extension: the agent watches its own context, writes a note_to_self at a clean checkpoint, compacts, and continues from the note verbatim.",
   "type": "module",
   "license": "MIT",
-  "repository": {"type": "git", "url": "git+https://github.com/prjct-app/pi-self-compact.git"},
-  "bugs": {"url": "https://github.com/prjct-app/pi-self-compact/issues"},
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/prjct-app/pi-self-compact.git"
+  },
+  "bugs": {
+    "url": "https://github.com/prjct-app/pi-self-compact/issues"
+  },
   "homepage": "https://github.com/prjct-app/pi-self-compact#readme",
   "keywords": [
     "pi-package",
@@ -20,7 +25,8 @@
   "pi": {
     "extensions": [
       "./index.ts"
-    ]
+    ],
+    "image": "https://raw.githubusercontent.com/prjct-app/pi-self-compact/main/docs/cover.png"
   },
   "files": [
     "index.ts",
@@ -51,7 +57,7 @@
     "typebox": "*"
   },
   "dependencies": {
-    "@prjct.app/pi-tui-kit": "^0.3.0",
+    "@prjct.app/pi-tui-kit": "^0.3.1",
     "@napi-rs/keyring": "1.3.0",
     "@typesafe-ai/sdk": "0.6.0"
   },
@@ -69,5 +75,8 @@
     "external": [
       "@napi-rs/keyring"
     ]
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }
