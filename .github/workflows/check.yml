@@ -17,7 +17,6 @@ jobs:
         with:
           node-version: 22.19.0
           cache: npm
-      - run: git clone --depth 1 https://github.com/prjct-app/pi-tui-kit ../pi-tui-kit && npm ci --prefix ../pi-tui-kit --ignore-scripts && npm run build --prefix ../pi-tui-kit
       - run: npm ci --ignore-scripts
       - run: npm run check
       - run: npm test
