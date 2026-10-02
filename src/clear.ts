@@ -37,7 +37,7 @@ export const CLEAR_DEFAULTS = { atTokens: 100_000, keepRequests: 20, minTokens: 
 export const CLEAR_WINDOW_CAP = 0.4;
 
 /** Tools whose results are the conversation itself, not bulk output. */
-const PROTECTED_TOOLS = new Set(['answer', 'self_compact', 'context_usage']);
+const PROTECTED_TOOLS = new Set(['answer', 'self_compact']);
 
 /** Marks a cleared tool result, so a second pass leaves it alone. */
 export const STUB_PREFIX = '[cleared by self-compact:';

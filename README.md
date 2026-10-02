@@ -29,7 +29,7 @@ The script builds `~/.pi/agent/builds/pi-self-compact`. Add `builds/pi-self-comp
 | --- | --- | --- | --- | --- |
 | notice | 100k tokens (≤ 50% of the window) | `--compact-soft-at` | a heads-up with live numbers | all |
 | warning | 150k (≤ 65%) | `--compact-at` | "write your note and compact soon" | all |
-| hard cutoff | warning + 30k (≤ 80%) | `--compact-buffer` | "compact now" | only `self_compact` and `context_usage` |
+| hard cutoff | warning + 30k (≤ 80%) | `--compact-buffer` | "compact now" | only `self_compact` |
 
 Lines are absolute because context rot follows tokens, not window share; on a small window the defaults clamp to the fractions shown. Flags take tokens (`270000`, `100k`, `1.5m`) or percentages (`20%`); explicit lines are capped at 90% of the window and must keep notice < warning.
 
@@ -65,7 +65,6 @@ A failed summary keeps the note and the lock and retries (up to three times, the
 | `/self-compact` | usage, lines, lock state, cycles and the pending note |
 | `/self-compact now` | ask the agent to write its note and compact now (reuses a saved note) |
 | `--no-self-compact` | off for this session |
-| `context_usage()` | the agent's own gauge as JSON |
 | `self_compact(note_to_self)` | the handoff |
 
 The footer belongs to pi-ui; the phase is published as the `self-compact` extension status (`ctx 55.1% WARNING`). Subagent children (`PI_SUBAGENTS_CHILD=1`) never install the extension.
