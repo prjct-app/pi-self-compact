@@ -1,6 +1,6 @@
 {
   "name": "@prjct.app/pi-self-compact",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "Pi extension: the agent watches its own context, writes a note_to_self at a clean checkpoint, compacts, and continues from the note verbatim.",
   "type": "module",
   "license": "MIT",

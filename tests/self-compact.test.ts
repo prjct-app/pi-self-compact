@@ -10,7 +10,6 @@ import { HANDOFF_TYPE, recoverState, STATE_TYPE, type EntryLike } from '../src/s
 import { cachedSummaryBlocker, extendPayload, replaceInstructions, summaryInputs } from '../src/summary.ts';
 import { levelFor, loadThresholdFile, parseSpec, resolveThresholds, DEFAULT_SPECS } from '../src/thresholds.ts';
 import { momentLine, momentState, verdictOf } from '../src/moment.ts';
-import { CLEAR_DEFAULTS, clearLine, planClear, STUB_PREFIX } from '../src/clear.ts';
 
 // keepRecentTokens reads Pi settings; never let the developer's own settings leak in.
 process.env.PI_CODING_AGENT_DIR = await mkdtemp(join(tmpdir(), 'pi-memory-sc-agent-'));
@@ -575,78 +574,22 @@ test('the notice line is awareness only: it never invites a compaction', () => {
   assert.match(BUILTIN_PROMPTS.warning, /call `self_compact`/);
 });
 
-/** A projected context of `requests` model requests, each a bash call with a ~500-token output. */
-const projected = (requests: number) => {
-  const entries: any[] = [{ sourceEntry: { id: 'u0', type: 'message' }, messages: [{ role: 'user', content: 'do it' }] }];
-  for (let n = 1; n <= requests; n += 1) {
-    const content: any[] = [{ type: 'thinking', thinking: 'plan', thinkingSignature: 'sig' },
-      { type: 'toolCall', id: `c${n}`, name: 'bash', arguments: { command: `cat big${n}.log` } }];
-    if (n === 1) content.push({ type: 'toolCall', id: 'e1', name: 'edit', arguments: { path: 'src/a.ts', edits: [{ oldText: 'o'.repeat(4_000), newText: 'n'.repeat(4_000) }] } });
-    entries.push({ sourceEntry: { id: `a${n}`, type: 'message' }, messages: [{ role: 'assistant', content }] });
-    entries.push({ sourceEntry: { id: `r${n}`, type: 'message' }, messages: [{ role: 'toolResult', toolCallId: `c${n}`, toolName: 'bash', content: [{ type: 'text', text: 'line\n'.repeat(400) }] }] });
-  }
-  entries.push({ sourceEntry: { id: 'small', type: 'message' }, messages: [{ role: 'toolResult', toolCallId: 'c1', toolName: 'bash', content: 'ok' }] });
-  entries.push({ sourceEntry: { id: 'ans', type: 'message' }, messages: [{ role: 'toolResult', toolCallId: 'x', toolName: 'answer', content: 'y'.repeat(4_000) }] });
-  return entries;
-};
-
-/** What Pi's projection shows after the edits: each target's content replaced. */
-const applyEdits = (entries: any[], edits: readonly any[]) => entries.map(entry => {
-  const edit = edits.find(item => item.targetId === entry.sourceEntry.id);
-  return edit ? { ...entry, messages: [{ ...entry.messages[0], content: edit.replacement.content }] } : entry;
-});
-
-test('clearing stubs stale tool output and long arguments outside the newest requests, once', () => {
-  const entries = projected(30);
-  const plan = planClear(entries, { keepRequests: 20, minTokens: 200 });
-  const targets = plan.edits.map(edit => edit.targetId);
-  // Requests 1-10 are 20 or more requests old: their outputs go, and request 1's edit body.
-  assert.deepEqual(targets, ['a1', ...Array.from({ length: 10 }, (_, i) => `r${i + 1}`)]);
-  assert.ok(!targets.includes('r11') && !targets.includes('small') && !targets.includes('ans'));
-  const stub = (plan.edits[1]!.replacement.content as any[])[0].text as string;
-  assert.ok(stub.startsWith(STUB_PREFIX));
-  assert.match(stub, /bash output, ~500 tokens · cat big1\.log\. Run it again/);
-  const assistant = plan.edits[0]!.replacement.content as any[];
-  assert.deepEqual(assistant.map(block => block.type), ['thinking', 'toolCall', 'toolCall'], 'thinking and every call stay');
-  assert.equal(assistant[0].thinkingSignature, 'sig');
-  assert.deepEqual(assistant[1], entries[1].messages[0].content[1], 'short arguments stay as sent');
-  const edit = assistant[2];
-  assert.equal(edit.id, 'e1');
-  assert.equal(edit.arguments.path, 'src/a.ts');
-  assert.match(edit.arguments.edits[0].oldText, /^o{100}… \[cleared ~1,000 tokens, already used\]$/);
-  assert.ok(plan.tokens > 10 * 400 + 1_500, `frees the outputs and the edit body (${plan.tokens})`);
-  assert.deepEqual(planClear(applyEdits(entries, plan.edits), { keepRequests: 20, minTokens: 200 }).edits, [], 'a second pass finds nothing');
-  assert.deepEqual(planClear(projected(15), { keepRequests: 20, minTokens: 200 }).edits, [], 'nothing is old enough yet');
-});
-
-test('the clearing line is capped to a share of small windows', () => {
-  assert.equal(clearLine(100_000, 1_000_000), 100_000);
-  assert.equal(clearLine(100_000, 128_000), 51_200);
-  assert.equal(clearLine(100_000, 0), 100_000);
-  assert.ok(CLEAR_DEFAULTS.batchTokens > CLEAR_DEFAULTS.minTokens);
-});
-
-test('turn_end clears in batches past the line, chains other proposals, and forces from the warning line', async t => {
-  const cwd = await mkdtemp(join(tmpdir(), 'pi-memory-sc-clear-'));
+test('self-compact never edits the context, however full it is', async t => {
+  // Clearing stale tool I/O at 100k (2026-09-29 to 10-03) stubbed the task in
+  // progress in half the cases; compaction is the only context limit.
+  const cwd = await mkdtemp(join(tmpdir(), 'pi-memory-sc-noclear-'));
   t.after(() => rm(cwd, { recursive: true, force: true }));
   const h = host(cwd);
+  const flags: string[] = [];
+  (h.pi as any).registerFlag = (name: string) => { flags.push(name); };
   installSelfCompact(h.pi);
   await h.emit('session_start', { reason: 'startup' });
-  const other = { type: 'custom', customType: 'other', data: 1 };
-  const boundary = (requests: number) => ({ entries: [other], context: { contextEntries: projected(requests) } });
-
-  h.gauge.tokens = 60_000;
-  assert.deepEqual(await h.emit('turn_end', boundary(90)), [undefined], 'below the clearing line nothing changes');
-
-  h.gauge.tokens = 110_000;
-  assert.deepEqual(await h.emit('turn_end', boundary(30)), [undefined], 'a batch smaller than batchTokens waits');
-  const [cleared] = await h.emit('turn_end', boundary(90));
-  assert.deepEqual(cleared.entries[0], other, 'proposals of earlier handlers are kept');
-  assert.equal(cleared.entries.length, 1 + 1 + 70);
-  assert.ok(cleared.entries.slice(1).every((entry: any) => entry.type === 'context_edit'));
-
-  h.gauge.tokens = 155_000;
-  const [forced] = await h.emit('turn_end', boundary(30));
-  assert.equal(forced.entries.length, 1 + 1 + 10, 'from the warning line any stale output is cleared');
-  assert.deepEqual(await h.emit('turn_end'), [undefined], 'an event without a boundary is tolerated');
+  const output = { type: 'text', text: 'line\n'.repeat(4_000) };
+  const contextEntries = Array.from({ length: 200 }, (_, n) => ({ sourceEntry: { id: `r${n}`, type: 'message' }, messages: [{ role: 'toolResult', toolCallId: `c${n}`, toolName: 'bash', content: [output] }] }));
+  for (const tokens of [60_000, 110_000, 155_000, 230_000]) {
+    h.gauge.tokens = tokens;
+    const results = await h.emit('turn_end', { entries: [], context: { contextEntries } });
+    assert.ok(results.every((result: unknown) => result === undefined), `no context edits at ${tokens}`);
+  }
+  assert.ok(flags.length > 0 && !flags.includes('context-clear-at'), 'no clearing flag');
 });
