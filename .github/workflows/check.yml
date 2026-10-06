@@ -21,4 +21,4 @@ jobs:
       - run: npm run check
       - run: npm test
       - run: npm pack --dry-run
-      - uses: prjct-app/pi-local-extensions/.github/actions/audit-production@931b051d7932bdcc0b2e6fc30b24e066e12c3edf
+      - run: npm audit --omit=dev

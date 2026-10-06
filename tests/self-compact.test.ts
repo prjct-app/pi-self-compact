@@ -2,7 +2,11 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { test } from 'node:test';
+import { after, before, test } from 'node:test';
+
+const privacyEnvironment = { previous: process.env.PRJCT_HOME, root: '' };
+before(async () => { privacyEnvironment.root = await mkdtemp(join(tmpdir(), 'pi-sc-private-')); process.env.PRJCT_HOME = privacyEnvironment.root; });
+after(async () => { if (privacyEnvironment.previous === undefined) delete process.env.PRJCT_HOME; else process.env.PRJCT_HOME = privacyEnvironment.previous; await rm(privacyEnvironment.root, { recursive: true, force: true }); });
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { installSelfCompact } from '../src/index.ts';
 import { SUMMARY_PROMPT } from '../src/prompts.ts';
@@ -137,10 +141,38 @@ test('explicit opt-out installs nothing', () => {
   assert.equal(h.handlers.size, 0);
 });
 
+test('a truncated or tool-calling summary never replaces the conversation', async t => {
+  const cwd = await mkdtemp(join(tmpdir(), 'pi-sc-incomplete-'));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  for (const stopReason of ['length', 'toolUse']) {
+    const h = host(cwd);
+    installSelfCompact(h.pi);
+    h.gauge.tokens = 232_000;
+    await captureRequest(h);
+    h.ctx.modelRegistry = { streamSimple: () => ({ result: async () => ({
+      role: 'assistant', stopReason, content: [{ type: 'text', text: 'The old task is complete. Pending correction:' }],
+      usage: { input: 100, output: 100, cacheRead: 0, cacheWrite: 0, totalTokens: 200 },
+    }) }) };
+    const results = await h.emit('session_before_compact', { reason: 'threshold', preparation: preparation(), signal: new AbortController().signal });
+    assert.deepEqual(results, [undefined], `${stopReason} must leave native Pi compaction in charge`);
+  }
+});
+
+test('summary payload disables tool selection while preserving opaque reasoning and source history', () => {
+  const input = [{ type: 'reasoning', encrypted_content: 'opaque-provider-state' }, { type: 'message', content: 'original task' }];
+  const session = { input, tool_choice: 'required', tools: [{ name: 'answer' }], reasoning: { effort: 'high' } };
+  const rebuilt = { input: [...input, { type: 'message', content: 'summarize' }], max_output_tokens: 32768 };
+  const result = extendPayload(session, rebuilt) as Record<string, unknown>;
+  assert.equal(result.tool_choice, 'none');
+  assert.deepEqual(result.input, rebuilt.input);
+  assert.deepEqual(result.reasoning, session.reasoning);
+  assert.equal(result.max_output_tokens, 32768);
+});
+
 test('the summary body is the session body with only the new input items appended', () => {
   const session = { model: 'm', tools: [{ name: 'grep', parameters: { properties: {} } }], service_tier: 'priority', input: [{ n: 1 }, { n: 2 }] };
   const rebuilt = { model: 'm', tools: [{ name: 'grep', strict: null }], input: [{ n: 1 }, { n: 2 }, { n: 3 }, { task: true }] };
-  assert.deepEqual(extendPayload(session, rebuilt), { ...session, input: [{ n: 1 }, { n: 2 }, { n: 3 }, { task: true }] });
+  assert.deepEqual(extendPayload(session, rebuilt), { ...session, tool_choice: 'none', input: [{ n: 1 }, { n: 2 }, { n: 3 }, { task: true }] });
   assert.equal(extendPayload(session, { input: [{ n: 9 }] }), undefined, 'no anchor: the rebuilt body goes out unchanged');
   assert.equal(extendPayload(undefined, rebuilt), undefined);
   assert.equal(extendPayload({ messages: [] }, rebuilt), undefined, 'non-Responses payloads are left alone');
