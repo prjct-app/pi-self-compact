@@ -1,3 +1,10 @@
+## 0.4.1 (2026-10-06)
+
+- Reject incomplete and tool-calling summaries and fall back to native Pi compaction.
+- Preserve active goals, user steering, constraints, evidence and live job state in the summary prompt.
+- Disable tool choice for Responses summaries while preserving opaque reasoning.
+- Use a model-bounded summary output budget and the published outbound privacy guard.
+
 # Changelog
 
 ## 0.4.0

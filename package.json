@@ -1,6 +1,6 @@
 {
   "name": "@prjct.app/pi-self-compact",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Pi extension: Pi's compaction summary, written by extending the session's cached request. Adds nothing to the context.",
   "type": "module",
   "license": "MIT",
@@ -44,7 +44,7 @@
   },
   "scripts": {
     "check": "tsc --noEmit && npm run check:immutable",
-    "test": "node --import tsx --test --test-concurrency=1 tests/*.test.ts",
+    "test": "node --import ./tests/isolate.mjs --import tsx --test --test-concurrency=1 tests/*.test.ts",
     "check:package": "npm pack --dry-run --ignore-scripts",
     "build": "rm -rf build && mkdir -p build && npm pack --ignore-scripts --pack-destination build >/dev/null && tar -xzf build/*.tgz -C build --strip-components=1 && rm -f build/*.tgz",
     "check:immutable": "! grep -rn '\\blet\\b' src/ || (echo 'Use immutable values: no let bindings in src/' && exit 1)",
@@ -55,8 +55,8 @@
     "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "1.0.0",
-    "@earendil-works/pi-coding-agent": "1.0.0",
+    "@earendil-works/pi-ai": "1.0.4",
+    "@earendil-works/pi-coding-agent": "1.0.4",
     "@types/node": "^22.19.0",
     "esbuild": "^0.28.1",
     "tsx": "^4.20.0",
@@ -64,5 +64,8 @@
   },
   "publishConfig": {
     "access": "public"
+  },
+  "dependencies": {
+    "@prjct.app/pi-secrets": "^0.2.1"
   }
 }

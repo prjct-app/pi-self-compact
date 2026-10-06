@@ -36,6 +36,13 @@ Compaction is configured in Pi's `settings.json` (see Pi's `docs/compaction.md`)
 
 Each compaction entry records `details.selfCompact` with `summary: "cache-shared"`, `input` and `cacheRead`. Entries without it are Pi's own summary.
 
+The summary preserves the active objective, user corrections, constraints, completed
+and pending work, execution evidence, live jobs and next actions. Incomplete or
+tool-calling summaries are rejected so Pi can use its native compaction path.
+Responses payloads disable tool choice for summarization and retain opaque
+reasoning. The summary budget is up to 32,768 tokens, bounded by model output
+limits and available context headroom. Outbound data uses pi-secrets protection.
+
 ## Development
 
 ```sh

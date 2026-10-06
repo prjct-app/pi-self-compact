@@ -2,6 +2,7 @@ import {
   convertToLlm, SettingsManager, type ExtensionContext, type SessionBeforeCompactEvent,
 } from '@earendil-works/pi-coding-agent';
 import type { Context } from '@earendil-works/pi-ai';
+import { protectOutboundData } from '@prjct.app/pi-secrets/privacy';
 
 /**
  * The compaction summary, written by extending the session's last request
@@ -44,13 +45,16 @@ export const extendPayload = (session: unknown, rebuilt: unknown): unknown => {
   const at = rebuilt.input.findLastIndex(item => JSON.stringify(item) === anchor);
   if (at < 0) return undefined;
   const { max_output_tokens: maxOutput } = rebuilt;
-  return { ...session, input: [...session.input, ...rebuilt.input.slice(at + 1)], ...(maxOutput === undefined ? {} : { max_output_tokens: maxOutput }) };
+  return { ...session, input: [...session.input, ...rebuilt.input.slice(at + 1)], tool_choice: 'none',
+    ...(maxOutput === undefined ? {} : { max_output_tokens: maxOutput }) };
 };
 
 export const modelKey = (model: { provider: string; id: string }): string => `${model.provider}/${model.id}`;
 
 /** Room the cache-shared request needs past the live context: the summary itself plus the instructions. */
-const CACHED_HEADROOM_TOKENS = 16_000;
+const SUMMARY_OUTPUT_TOKENS = 32_768;
+const SUMMARY_INSTRUCTION_TOKENS = 2_048;
+const summaryOutputTokens = (model: { maxTokens?: number }): number => Math.min(model.maxTokens || SUMMARY_OUTPUT_TOKENS, SUMMARY_OUTPUT_TOKENS);
 
 const JOURNALED_ROLES = new Set(['user', 'assistant', 'toolResult', 'bashExecution']);
 
@@ -65,7 +69,7 @@ export const cachedSummaryBlocker = (
   if (!snapshot) return 'no session request captured yet';
   if (!ctx.model || modelKey(ctx.model) !== snapshot.model) return 'the model changed since the last request';
   if (event.reason === 'overflow') return 'overflow recovery';
-  if (usedTokens === null || usedTokens + CACHED_HEADROOM_TOKENS > ctx.model.contextWindow) return 'no room to resend the context';
+  if (usedTokens === null || usedTokens + summaryOutputTokens(ctx.model) + SUMMARY_INSTRUCTION_TOKENS > ctx.model.contextWindow) return 'no room to resend the context';
   // The newest journaled message must be the newest one the snapshot carries.
   const journaled = [...ctx.sessionManager.getBranch()].reverse().find(entry => entry.type === 'message');
   const carried = [...snapshot.messages, ...snapshot.tail].reverse()
@@ -89,20 +93,22 @@ export const generateCachedSummary = async (
   const task = [
     system,
     'Summarize the conversation above for the compaction. Reply with the summary text only and call no tools.',
-    `Everything before the most recent ~${keepRecentTokens(ctx.cwd).toLocaleString('en-US')} tokens is replaced by your summary; that recent part stays verbatim, so keep it brief.`,
+    `Pi retains about ${keepRecentTokens(ctx.cwd).toLocaleString('en-US')} recent tokens verbatim. Preserve the full active objective and unresolved constraints even if they appear in that recent part; avoid repeating routine tool output.`,
     event.customInstructions ? `Additional summarization instructions from the operator: ${event.customInstructions}` : '',
   ].filter(Boolean).join('\n\n');
   // System messages carry the prompt and tool declarations; pass them through untouched
   // (hosts before 0.87 drop them in convertToLlm).
   const history = [...snapshot.messages, ...snapshot.tail].flatMap(message => (message as { role?: string }).role === 'system'
     ? [message as Context['messages'][number]] : convertToLlm([message] as Messages));
-  const context: Context = { messages: [...history, { role: 'user', content: [{ type: 'text', text: task }], timestamp: Date.now() }] };
+  const context: Context = await protectOutboundData({ messages: [...history, { role: 'user', content: [{ type: 'text', text: task }], timestamp: Date.now() }] });
   const options = {
-    maxTokens: Math.min(model.maxTokens || 8192, 8192),
+    maxTokens: summaryOutputTokens(model),
     signal: event.signal,
     sessionId: ctx.sessionManager.getSessionId(),
     ...(model.reasoning && ctx.thinkingLevel && ctx.thinkingLevel !== 'off' ? { reasoning: ctx.thinkingLevel } : {}),
-    onPayload: (body: unknown) => extendPayload(snapshot.payload, body),
+    // The final tool results were produced after the last guarded request.
+    // Guard both them and the reused provider body before this auxiliary call.
+    onPayload: async (body: unknown) => protectOutboundData(extendPayload(snapshot.payload, body) ?? body),
   };
   // The session streams through streamSimple (Pi 0.87+); older hosts only offer complete().
   type Registry = typeof ctx.modelRegistry & {
@@ -114,6 +120,9 @@ export const generateCachedSummary = async (
     : await ctx.modelRegistry.complete(model, context, options);
   if (event.signal.aborted || response.stopReason === 'aborted') throw new Error('Compaction summary cancelled.');
   if (response.stopReason === 'error') throw new Error(response.errorMessage || 'Summary request failed.');
+  if (response.stopReason !== 'stop' || response.content.some(block => block.type === 'toolCall')) {
+    throw new Error(`Incomplete compaction summary (${response.stopReason}); preserving native compaction.`);
+  }
   const text = response.content.flatMap(block => block.type === 'text' ? [block.text] : []).join('\n').trim();
   if (!text) throw new Error('Summary response was empty.');
   const modified = new Set([...preparation.fileOps.edited, ...preparation.fileOps.written]);
