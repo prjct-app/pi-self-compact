@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.4.0
+
+- Breaking: only the compaction summary is left. The `self_compact` tool, `note_to_self`, the notice, warning and hard-cutoff messages, the tool lock, the Jev moment, `thresholds.json`, prompt overrides, flags and `/self-compact` are gone. Pi decides when to compact (`compaction.reserveTokens`) and what stays verbatim (`compaction.keepRecentTokens`).
+- Why: from 2026-10-03 to 10-05, 52 compactions took 220 `self_compact` calls (162 rejected by the 12,000-character cap) and 10.4% of all model output. Each retry squeezed the note further until words ran together ("SpanishJJ, English spacedteams"), and that shorthand was the only thing the model read verbatim after a compaction, so it spread to later notes and team messages.
+- Every compaction Pi starts (threshold or `/compact`) now gets the cache-shared summary; overflow recovery and any failure fall back to Pi's own summary.
+
+## 0.3.0
 
 - With a TypeSafe key, Jev judges the moment after each turn past the notice line (task switched, unit finished, edit half done), without waiting on it. A finished run that moved on hands off early; at the warning line a clean checkpoint is told to compact now. A half-done edit never triggers anything; no key or any error keeps the token lines alone.
 - `thresholds.json` in `.pi/self-compact/` (project) or `~/.pi/agent/self-compact/` (global) sets persistent lines; flags still win. A bad file disables self-compact with the reason, and `/self-compact` shows where the lines came from.

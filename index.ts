@@ -1,1 +1,1 @@
-export { default, installSelfCompact, type SelfCompactController, type SelfCompactOptions } from './src/index.ts';
+export { default, installSelfCompact, type SelfCompactOptions } from './src/index.ts';
