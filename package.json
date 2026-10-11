@@ -1,6 +1,6 @@
 {
   "name": "@prjct.app/pi-self-compact",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Pi extension: Pi's compaction summary, written by extending the session's cached request. Adds nothing to the context.",
   "type": "module",
   "license": "MIT",
@@ -51,7 +51,7 @@
     "build:pi": "node scripts/build-pi.mjs"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-ai": ">=1.0.4",
     "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
@@ -66,6 +66,6 @@
     "access": "public"
   },
   "dependencies": {
-    "@prjct.app/pi-secrets": "^0.2.1"
+    "@prjct.app/pi-secrets": "^0.2.6"
   }
 }

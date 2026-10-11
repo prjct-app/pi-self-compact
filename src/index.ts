@@ -59,7 +59,7 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
     const snapshot = R.snapshot;
     if (!snapshot || cachedSummaryBlocker(event, ctx, snapshot, ctx.getContextUsage()?.tokens ?? null)) return undefined;
     try {
-      const result = await generateCachedSummary(event, ctx, SUMMARY_PROMPT, snapshot);
+      const result = await generateCachedSummary(event, ctx, SUMMARY_PROMPT, snapshot, pi.getSettings?.() ?? {});
       return { compaction: { ...result, details: {
         ...result.details,
         selfCompact: { summary: 'cache-shared', input: result.usage.input, cacheRead: result.usage.cacheRead },

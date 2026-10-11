@@ -27,6 +27,7 @@ const host = (cwd: string) => {
     registerTool: record('tool'), registerFlag: record('flag'), registerCommand: record('command'),
     registerMessageRenderer: record('renderer'), registerEntryRenderer: record('renderer'),
     appendEntry: record('entry'), sendMessage: record('message'), sendUserMessage: record('message'),
+    getSettings: () => ({ thinkingBudgets: { high: 21000 } }),
   } as unknown as ExtensionAPI;
   entries.push({ type: 'message', id: 'u1', parentId: null, timestamp: new Date().toISOString(),
     message: { role: 'user', content: 'x'.repeat(200_000), timestamp: 1 } });
@@ -51,6 +52,7 @@ const host = (cwd: string) => {
 };
 
 const preparation = () => ({ firstKeptEntryId: 'u2', tokensBefore: 155_000, messagesToSummarize: [], turnPrefixMessages: [], isSplitTurn: false,
+  settings: { enabled: true, reserveTokens: 40000, keepRecentTokens: 71000 },
   fileOps: { read: new Set(['a.ts', 'b.ts']), written: new Set<string>(), edited: new Set(['b.ts']) } });
 
 /** Captures one session request and the reply after it, as Pi would journal them. */
@@ -88,6 +90,8 @@ test('an automatic compaction gets the summary that extends the cached session r
   const h = host(cwd);
   installSelfCompact(h.pi);
   await h.emit('session_start', { reason: 'startup' });
+  h.ctx.model.reasoning = true;
+  h.ctx.thinkingLevel = 'high';
   const requests: { context: any; options: any }[] = [];
   h.ctx.modelRegistry = {
     streamSimple(_model: unknown, context: unknown, options: unknown) {
@@ -104,8 +108,12 @@ test('an automatic compaction gets the summary that extends the cached session r
   assert.deepEqual(context.messages.slice(0, -1), [...sent, answer, toolResult], 'the sent transcript is the unchanged prefix');
   assert.equal(context.messages.at(-1).role, 'user');
   assert.match(context.messages.at(-1).content[0].text, /context-compaction summarizer/);
+  assert.match(context.messages.at(-1).content[0].text, /71,000 recent tokens/, 'Pi supplies the effective model-specific retention setting');
   assert.equal(context.systemPrompt, undefined, 'the system prompt stays the session one');
   assert.equal(options.sessionId, 'sc-session', 'routed to the session cache');
+  assert.equal(options.toolChoice, 'none', 'all providers must produce text, not tool calls');
+  assert.equal(options.reasoning, 'high', 'the active reasoning level is preserved');
+  assert.deepEqual(options.thinkingBudgets, { high: 21000 }, 'custom reasoning budgets are also preserved');
   assert.equal(result.compaction.summary, 'SUMMARY\n\n<read-files>\na.ts\n</read-files>\n\n<modified-files>\nb.ts\n</modified-files>');
   assert.equal(result.compaction.firstKeptEntryId, 'u2');
   assert.equal(result.compaction.details.selfCompact.summary, 'cache-shared');

@@ -1,3 +1,13 @@
+## 0.4.2 (2026-10-07)
+
+- Extract summary text through the public Pi contentText helper. The active model, reasoning budget and summary validation are unchanged. Requires pi-ai 1.0.4 or newer.
+
+- Preserve configured thinking budgets when generating a summary.
+- Use Pi's effective compaction preparation for recent-history retention, including per-model overrides, without rereading a different settings scope.
+
+- Disable summary tool calls through Pi's provider-neutral option for Anthropic, Chat Completions and Responses, preserving the transcript, tool declarations, model and reasoning level.
+- Add offline provider-adapter regressions for summary options and stale context metadata clamping output to one token. No compaction thresholds or model limits are changed.
+
 ## 0.4.1 (2026-10-06)
 
 - Reject incomplete and tool-calling summaries and fall back to native Pi compaction.

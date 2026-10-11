@@ -1,7 +1,7 @@
 import {
-  convertToLlm, SettingsManager, type ExtensionContext, type SessionBeforeCompactEvent,
+  convertToLlm, type ExtensionAPI, type ExtensionContext, type SessionBeforeCompactEvent,
 } from '@earendil-works/pi-coding-agent';
-import type { Context } from '@earendil-works/pi-ai';
+import { contentText, type Context } from '@earendil-works/pi-ai';
 import { protectOutboundData } from '@prjct.app/pi-secrets/privacy';
 
 /**
@@ -9,9 +9,6 @@ import { protectOutboundData } from '@prjct.app/pi-secrets/privacy';
  * instead of replaying the history as text. Adapted from
  * disler/self-compact-pi-agent (MIT, Copyright (c) 2026 IndyDevDan).
  */
-
-/** Pi's retained recent history for this directory (global settings merged with the project's). */
-export const keepRecentTokens = (cwd: string): number => SettingsManager.create(cwd).getCompactionKeepRecentTokens();
 
 type Messages = SessionBeforeCompactEvent['preparation']['messagesToSummarize'];
 
@@ -86,6 +83,7 @@ export const cachedSummaryBlocker = (
  */
 export const generateCachedSummary = async (
   event: SessionBeforeCompactEvent, ctx: ExtensionContext, system: string, snapshot: RequestSnapshot,
+  settings: Pick<ReturnType<ExtensionAPI['getSettings']>, 'thinkingBudgets'> = {},
 ) => {
   const model = ctx.model;
   if (!model) throw new Error('No model available for compaction.');
@@ -93,7 +91,7 @@ export const generateCachedSummary = async (
   const task = [
     system,
     'Summarize the conversation above for the compaction. Reply with the summary text only and call no tools.',
-    `Pi retains about ${keepRecentTokens(ctx.cwd).toLocaleString('en-US')} recent tokens verbatim. Preserve the full active objective and unresolved constraints even if they appear in that recent part; avoid repeating routine tool output.`,
+    `Pi retains about ${preparation.settings.keepRecentTokens.toLocaleString('en-US')} recent tokens verbatim. Preserve the full active objective and unresolved constraints even if they appear in that recent part; avoid repeating routine tool output.`,
     event.customInstructions ? `Additional summarization instructions from the operator: ${event.customInstructions}` : '',
   ].filter(Boolean).join('\n\n');
   // System messages carry the prompt and tool declarations; pass them through untouched
@@ -103,6 +101,10 @@ export const generateCachedSummary = async (
   const context: Context = await protectOutboundData({ messages: [...history, { role: 'user', content: [{ type: 'text', text: task }], timestamp: Date.now() }] });
   const options = {
     maxTokens: summaryOutputTokens(model),
+    // Keep the tool declarations in the cached prefix, but forbid new tool calls
+    // through Pi's provider-neutral option (Anthropic and Chat Completions too).
+    toolChoice: 'none' as const,
+    thinkingBudgets: settings.thinkingBudgets,
     signal: event.signal,
     sessionId: ctx.sessionManager.getSessionId(),
     ...(model.reasoning && ctx.thinkingLevel && ctx.thinkingLevel !== 'off' ? { reasoning: ctx.thinkingLevel } : {}),
@@ -123,7 +125,7 @@ export const generateCachedSummary = async (
   if (response.stopReason !== 'stop' || response.content.some(block => block.type === 'toolCall')) {
     throw new Error(`Incomplete compaction summary (${response.stopReason}); preserving native compaction.`);
   }
-  const text = response.content.flatMap(block => block.type === 'text' ? [block.text] : []).join('\n').trim();
+  const text = contentText(response.content).trim();
   if (!text) throw new Error('Summary response was empty.');
   const modified = new Set([...preparation.fileOps.edited, ...preparation.fileOps.written]);
   const readFiles = [...preparation.fileOps.read].filter(file => !modified.has(file)).sort();
