@@ -76,7 +76,7 @@ test('adds nothing the model sees: no tool, no flag, no command, no context or t
   const h = host(cwd);
   assert.equal(installSelfCompact(h.pi), true);
   assert.deepEqual(h.registered, []);
-  for (const name of ['context', 'tool_call', 'before_agent_start', 'turn_end', 'agent_end', 'agent_settled']) {
+  for (const name of ['context', 'tool_call', 'before_agent_start', 'turn_end', 'agent_settled']) {
     assert.equal(h.handlers.has(name), false, `${name} is not hooked`);
   }
   await h.emit('session_start', { reason: 'startup' });
@@ -104,8 +104,9 @@ test('an automatic compaction gets the summary that extends the cached session r
   h.gauge.tokens = 232_000;
   const { sent, answer, toolResult } = await captureRequest(h);
   const [result] = await h.emit('session_before_compact', { reason: 'threshold', preparation: preparation(), signal: new AbortController().signal });
-  assert.equal(requests.length, 1, 'one request, no replay');
-  const { context, options } = requests[0]!;
+  const summaryRequests = requests.filter(request => /context-compaction summarizer/.test(JSON.stringify(request.context.messages.at(-1))));
+  assert.equal(summaryRequests.length, 1, 'one summary request, no replay (the state update answered no edits, so the summary runs)');
+  const { context, options } = summaryRequests[0]!;
   assert.deepEqual(context.messages.slice(0, -1), [...sent, answer, toolResult], 'the sent transcript is the unchanged prefix');
   assert.equal(context.messages.at(-1).role, 'user');
   assert.match(context.messages.at(-1).content[0].text, /context-compaction summarizer/);
@@ -139,7 +140,7 @@ test('without a model registry or when every summarizer fails, Pi keeps its own 
   assert.deepEqual(await h.emit('session_before_compact', { reason: 'overflow', preparation: preparation(), signal }), [undefined]);
   h.ctx.modelRegistry = { streamSimple: () => ({ result: async () => { throw new Error('provider down'); } }) };
   assert.deepEqual(await h.emit('session_before_compact', { reason: 'threshold', preparation: preparation(), signal }), [undefined]);
-  assert.match(h.notices.join('\n'), /Pi's summarizer writes it \(provider down\)/);
+  assert.match(h.notices.join('\n'), /project state unavailable|Pi's summarizer writes it \(provider down\)/);
   await h.emit('session_compact', {});
   assert.deepEqual(await h.emit('session_before_compact', { reason: 'manual', preparation: preparation(), signal }), [undefined], 'a compaction drops the snapshot');
 });

@@ -69,9 +69,14 @@ const JOURNALED_ROLES = new Set(['user', 'assistant', 'toolResult', 'bashExecuti
 export const cachedSummaryBlocker = (
   event: SessionBeforeCompactEvent, ctx: ExtensionContext, snapshot: RequestSnapshot | undefined, usedTokens: number | null,
 ): string | undefined => {
+  if (event.reason === 'overflow') return 'overflow recovery';
+  return snapshotBlocker(ctx, snapshot, usedTokens);
+};
+
+/** Why a captured request cannot be extended now, or undefined when it can. */
+export const snapshotBlocker = (ctx: ExtensionContext, snapshot: RequestSnapshot | undefined, usedTokens: number | null): string | undefined => {
   if (!snapshot) return 'no session request captured yet';
   if (!ctx.model || modelKey(ctx.model) !== snapshot.model) return 'the model changed since the last request';
-  if (event.reason === 'overflow') return 'overflow recovery';
   if (usedTokens === null || usedTokens + summaryOutputTokens(ctx.model) + SUMMARY_INSTRUCTION_TOKENS > ctx.model.contextWindow) return 'no room to resend the context';
   // The newest journaled message must be the newest one the snapshot carries.
   const journaled = [...ctx.sessionManager.getBranch()].reverse().find(entry => entry.type === 'message');
@@ -81,38 +86,32 @@ export const cachedSummaryBlocker = (
   return undefined;
 };
 
+type Settings = Pick<ReturnType<ExtensionAPI['getSettings']>, 'thinkingBudgets'>;
+
 /**
- * Summarizes by extending the last session request instead of replaying it as
- * text: same system prompt, same tool declarations, same messages, same
- * session id, one extra user message. The provider bills the shared prefix as
- * cached input, and the Codex WebSocket sends only the new message.
+ * One auxiliary request that extends the last session request instead of
+ * replaying it as text: same system prompt, same tool declarations, same
+ * messages, same session id, one extra user message. The provider bills the
+ * shared prefix as cached input, and the Codex WebSocket sends only the new
+ * message. Only a finished text answer is accepted.
  */
-export const generateCachedSummary = async (
-  event: SessionBeforeCompactEvent, ctx: ExtensionContext, system: string, snapshot: RequestSnapshot,
-  settings: Pick<ReturnType<ExtensionAPI['getSettings']>, 'thinkingBudgets'> = {}, extra = '',
+export const askCached = async (
+  ctx: ExtensionContext, snapshot: RequestSnapshot, task: string, settings: Settings = {}, signal?: AbortSignal, maxTokens?: number,
 ) => {
   const model = ctx.model;
-  if (!model) throw new Error('No model available for compaction.');
-  const { preparation } = event;
-  const task = [
-    system,
-    'Summarize the conversation above for the compaction. Reply with the summary text only and call no tools.',
-    `Pi retains about ${preparation.settings.keepRecentTokens.toLocaleString('en-US')} recent tokens verbatim. Preserve the full active objective and unresolved constraints even if they appear in that recent part; avoid repeating routine tool output.`,
-    event.customInstructions ? `Additional summarization instructions from the operator: ${event.customInstructions}` : '',
-    extra,
-  ].filter(Boolean).join('\n\n');
+  if (!model) throw new Error('No model available.');
   // System messages carry the prompt and tool declarations; pass them through untouched
   // (hosts before 0.87 drop them in convertToLlm).
   const history = [...snapshot.messages, ...snapshot.tail].flatMap(message => (message as { role?: string }).role === 'system'
     ? [message as Context['messages'][number]] : convertToLlm([message] as Messages));
   const context: Context = await protectOutboundData({ messages: [...history, { role: 'user', content: [{ type: 'text', text: task }], timestamp: Date.now() }] });
   const options = {
-    maxTokens: summaryOutputTokens(model),
+    maxTokens: maxTokens ?? summaryOutputTokens(model),
     // Keep the tool declarations in the cached prefix, but forbid new tool calls
     // through Pi's provider-neutral option (Anthropic and Chat Completions too).
     toolChoice: 'none' as const,
     thinkingBudgets: settings.thinkingBudgets,
-    signal: event.signal,
+    signal,
     sessionId: ctx.sessionManager.getSessionId(),
     ...(model.reasoning && ctx.thinkingLevel && ctx.thinkingLevel !== 'off' ? { reasoning: ctx.thinkingLevel } : {}),
     // The final tool results were produced after the last guarded request.
@@ -123,26 +122,65 @@ export const generateCachedSummary = async (
   const response = registry.streamSimple
     ? await registry.streamSimple(model, context, options).result()
     : await ctx.modelRegistry.complete(model, context, options);
-  if (event.signal.aborted || response.stopReason === 'aborted') throw new Error('Compaction summary cancelled.');
-  if (response.stopReason === 'error') throw new Error(response.errorMessage || 'Summary request failed.');
+  if (signal?.aborted || response.stopReason === 'aborted') throw new Error('Request cancelled.');
+  if (response.stopReason === 'error') throw new Error(response.errorMessage || 'Request failed.');
   if (response.stopReason !== 'stop' || response.content.some(block => block.type === 'toolCall')) {
-    throw new Error(`Incomplete compaction summary (${response.stopReason}); preserving native compaction.`);
+    throw new Error(`Incomplete answer (${response.stopReason}).`);
   }
   const text = contentText(response.content).trim();
-  if (!text) throw new Error('Summary response was empty.');
-  const modified = new Set([...preparation.fileOps.edited, ...preparation.fileOps.written]);
-  const readFiles = [...preparation.fileOps.read].filter(file => !modified.has(file)).sort();
+  if (!text) throw new Error('Empty answer.');
+  return { text, usage: response.usage };
+};
+
+/** A standalone request through the session's model registry, outbound data guarded. */
+export const askPlain = async (ctx: ExtensionContext, text: string, signal?: AbortSignal, maxTokens = 8_000) => {
+  const model = ctx.model;
+  if (!model) throw new Error('No model available.');
+  const registry = ctx.modelRegistry as Registry<StreamOptions>;
+  if (!registry?.streamSimple) throw new Error('This Pi host has no streamSimple.');
+  const context = await protectOutboundData({ messages: [{ role: 'user' as const, content: [{ type: 'text' as const, text }], timestamp: Date.now() }] });
+  const response = await registry.streamSimple(model, context as Context, {
+    maxTokens, signal, ...(model.reasoning && ctx.thinkingLevel && ctx.thinkingLevel !== 'off' ? { reasoning: ctx.thinkingLevel } : {}),
+    onPayload: async (body: unknown) => protectOutboundData(body),
+  }).result();
+  if (response.stopReason !== 'stop' || response.content.some(block => block.type === 'toolCall')) throw new Error(`Incomplete answer (${response.stopReason}).`);
+  return { text: contentText(response.content).trim(), usage: response.usage };
+};
+
+type FileOps = SessionBeforeCompactEvent['preparation']['fileOps'];
+
+export const fileLists = (fileOps: FileOps) => {
+  const modified = new Set([...fileOps.edited, ...fileOps.written]);
+  const readFiles = [...fileOps.read].filter(file => !modified.has(file)).sort();
   const modifiedFiles = [...modified].sort();
-  const files = [
+  const text = [
     readFiles.length ? `<read-files>\n${readFiles.join('\n')}\n</read-files>` : '',
     modifiedFiles.length ? `<modified-files>\n${modifiedFiles.join('\n')}\n</modified-files>` : '',
   ].filter(Boolean).join('\n\n');
+  return { text, readFiles, modifiedFiles };
+};
+
+/** The cache-shared compaction summary (used when no project state is available). */
+export const generateCachedSummary = async (
+  event: SessionBeforeCompactEvent, ctx: ExtensionContext, system: string, snapshot: RequestSnapshot,
+  settings: Settings = {}, extra = '',
+) => {
+  const { preparation } = event;
+  const task = [
+    system,
+    'Summarize the conversation above for the compaction. Reply with the summary text only and call no tools.',
+    `Pi retains about ${preparation.settings.keepRecentTokens.toLocaleString('en-US')} recent tokens verbatim. Preserve the full active objective and unresolved constraints even if they appear in that recent part; avoid repeating routine tool output.`,
+    event.customInstructions ? `Additional summarization instructions from the operator: ${event.customInstructions}` : '',
+    extra,
+  ].filter(Boolean).join('\n\n');
+  const { text, usage } = await askCached(ctx, snapshot, task, settings, event.signal);
+  const files = fileLists(preparation.fileOps);
   return {
-    summary: files ? `${text}\n\n${files}` : text,
+    summary: files.text ? `${text}\n\n${files.text}` : text,
     firstKeptEntryId: preparation.firstKeptEntryId,
     tokensBefore: preparation.tokensBefore,
-    usage: response.usage,
-    details: { readFiles, modifiedFiles },
+    usage,
+    details: { readFiles: files.readFiles, modifiedFiles: files.modifiedFiles },
   };
 };
 

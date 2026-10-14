@@ -7,7 +7,7 @@ Pi decides when to compact and how much recent history stays verbatim. This exte
 - **Cheaper.** The provider bills the shared prefix as cached input. Measured on Codex: about 10.7k uncached input tokens per compaction, against about 72k for Pi's replayed summary.
 - **Better input.** The summarizer reads every tool result whole; Pi's replay cuts each one to 2,000 characters.
 
-It adds nothing to the context: no tool, no guidance messages, no notes, no locks, no commands. When the cached summary cannot run (overflow recovery, a model change since the last request, a stale snapshot, a provider error), Pi's own summarizer writes it.
+It adds no tool, no guidance messages, no locks and no commands; the project state reaches the model only as the compaction summary. When the cached summary cannot run (overflow recovery, a model change since the last request, a stale snapshot, a provider error), Pi's own summarizer writes it.
 
 Adapted from [disler/self-compact-pi-agent](https://github.com/disler/self-compact-pi-agent) (MIT); see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
@@ -33,6 +33,26 @@ Compaction is configured in Pi's `settings.json` (see Pi's `docs/compaction.md`)
 ```
 
 `reserveTokens` sets when Pi compacts (`contextWindow - reserveTokens`: about 232k on a 272k window). `keepRecentTokens` is the recent history kept verbatim; everything before it is replaced by the summary.
+
+## The summary is a project state, not a summary of a summary
+
+Long sessions compact many times, and rewriting the summary on each pass loses things on each pass. So the session keeps a **project state** instead, and a compaction renders it:
+
+- **Updated after each run, item by item.** When a run ends, the model returns edits (`add`, `update`, `resolve`) for rules, decisions, open work and facts. Nothing is regenerated, so nothing drifts. The update extends the session's cached request in the background while the user reads the answer. Runs woken by a small message (a team wake) are folded together with the next one.
+- **Rules in the user's words.** A rule points at the user message it came from, and the host copies that message verbatim (expanded skills and pasted logs are not quoted).
+- **Kept small.** Past about 24,000 characters the model reviews the state and closes what is done, stale or duplicated. A review never touches rules: they change only when the user replaces them. Resolved items stay in the saved state and the journal.
+- **Stored as a custom entry** (`self-compact-state`), never sent to the model as a message. Sessions that predate the state start from their last compaction summary.
+- **Fallback.** If the state cannot be updated (no model answer, malformed edits), the compaction writes a summary followed by the user's messages that still apply, as described below.
+
+Measured by replaying three real long sessions (21, 23 and 17 compactions; the final context answered 26 fixed questions three times, including rules never stated and files never touched):
+
+| | Summary chain | Summary + kept user messages | Project state |
+|---|---|---|---|
+| Real early rules remembered | 24–26% | 54–57% | 67–87% |
+| Rules never stated, answered as real | 3–8% | 0% | 0% |
+| Real files remembered | 93–100% | 100% | 99% |
+
+Folding only at compaction time (spans of ~200k tokens) remembered 50% of the rules; folding after each run is what makes the difference.
 
 ## Your messages that still apply survive every compaction
 
@@ -71,7 +91,7 @@ The compaction chains of three real long sessions (21, 23 and 17 compactions) we
 
 When the cache-shared summary cannot run, Pi's own summarizer is called through the session's model registry with the same choice to make. If that fails as well, Pi compacts on its own path, and the next compaction offers the messages again.
 
-Each compaction entry records `details.selfCompact`: `summary` is `"cache-shared"` (with `input` and `cacheRead`) or `"native"`, and `ledger` holds the kept message and character counts, whether the model chose (`selected: "model"`) or everything was kept (`"all"`), and the cumulative `dropped` ids. Entries without it are Pi's own summary.
+Each compaction entry records `details.selfCompact`: `summary` is `"state"` (with the live `items`, `rules` and `characters`), `"cache-shared"` (with `input` and `cacheRead`) or `"native"`, and `ledger` holds the kept message and character counts, whether the model chose (`selected: "model"`) or everything was kept (`"all"`), and the cumulative `dropped` ids. Entries without it are Pi's own summary.
 
 The summary preserves the active objective, user corrections, constraints, completed
 and pending work, execution evidence, live jobs and next actions. Incomplete or

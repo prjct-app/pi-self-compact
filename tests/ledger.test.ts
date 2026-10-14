@@ -97,10 +97,11 @@ test('overflow and other blocked cases still carry the ledger, through Pi\'s sum
     },
   };
   const [result] = await host(registry).compact('overflow');
-  assert.equal(sent.length, 1);
-  assert.equal(sent[0]!.includes(LEDGER_HEADER), false, 'the previous ledger is not handed to the summarizer');
-  assert.match(sent[0]!, /OLD SUMMARY/);
-  assert.equal(sent[0]!.includes('AKIAIOSFODNN7EXAMPLE'), false, 'pi-secrets guards the summary request');
+  const summarySent = sent.filter(text => /OLD SUMMARY/.test(text));
+  assert.equal(summarySent.length, 1, 'the state update answered no edits, so Pi\'s summarizer runs once');
+  assert.equal(summarySent[0]!.includes(LEDGER_HEADER), false, 'the previous ledger is not handed to the summarizer');
+  assert.equal(sent.some(text => text.includes('AKIAIOSFODNN7EXAMPLE')), false, 'pi-secrets guards every request');
+  sent.splice(0, sent.length, ...summarySent);
   assert.match(result.compaction.summary, /^NATIVE SUMMARY\n\n## User messages, verbatim/u);
   assert.match(result.compaction.summary, /u1\] No toques producción/u);
   assert.equal(result.compaction.details.selfCompact.summary, 'native');
