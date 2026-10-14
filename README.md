@@ -51,31 +51,27 @@ So the summarizer, the session's own model, is shown the user's messages by id a
 - Messages over 2,000 characters keep their start and point at their entry id.
 - In a live test (standing rule, a task that was finished, "continua", a second task, two compactions) the model kept only the standing rule both times, and the agent restated it exactly afterwards.
 
-## An index of the evidence, by entry id
+## File lists for the whole session
 
-After a compaction the model sees the summary, not the tool output, and the summary is rewritten every time. In a live test a file read before the first compaction was gone from the summary after the second, and the model then said it had never read a file. Measured on real sessions, right after a compaction the model asks for paths that do not exist about twice as often as 200 calls later.
+Pi carries `<read-files>`/`<modified-files>` forward only from its own compactions and skips summaries an extension wrote. So after a cache-shared compaction the next summary listed only its own span: in a live test a file read before the first compaction was gone after the second, and the model said it had never read a file. The lists are now rebuilt from the session branch, so every file the session read or changed stays listed, and a file edited and later read still counts as modified.
 
-So every summary also gets an index, built mechanically from the session branch:
+## Measured on real sessions
 
-```
-## Evidence index (session entry ids; their full text stays in the session journal)
-Read any of them with memory_context (action read, entryId).
-Files touched in this session (latest state):
-[c8c74183] read config.env.txt · 41 lines
-Commands whose latest run failed:
-[c03f51eb] $ pnpm test → failed (exit 1)
-Failed calls in this span:
-[r5] read src/missing.ts failed: ENOENT: no such file
-```
+The compaction chains of three real long sessions (21, 23 and 17 compactions) were replayed with Pi's summarizer, once as published and once with the ledger. Each final context then answered 26 fixed questions, three times: the user's real early rules mixed with rules never stated, and files really changed mixed with files of the same repo never touched.
 
-- Files cover the whole session, at their latest state, so nothing the agent read disappears. Paths under the cwd are relative. The section replaces Pi's path-only `<read-files>`/`<modified-files>` lists in the summary text; the compaction details still carry them.
-- Failures cover only the span being compacted. A command that failed and later passed is not listed, and neither are successful commands: listing every command measured 3.5k tokens at the median and 49k at worst.
-- Measured on 500 real compactions: about 1.1k extra tokens at the median (p90 4.5k, largest 12k), in the cached prefix.
-- With the index, the same live test answered exactly after two compactions: the model saw the entry and read the file again.
+| | Published | With the ledger |
+|---|---|---|
+| Real rules remembered | 24% (13/54) | 54% (29/54) |
+| Real files remembered | 97% (70/72) | 100% (72/72) |
+| Rules never stated, answered as real | 3% (1/36) | 0% (0/36) |
+| Files never touched, answered as real | 0% | 0% |
+| Final context size | | +3–15% |
+
+"Preservar las pantallas, no sustituirlas por vistas simplificadas" was "unknown" three times out of three as published and "yes" three times with the ledger. One rule went the other way (a Supabase constraint the ledger did not keep). An earlier variant that also listed an evidence index by entry id was dropped: it cost up to 10k tokens and lost "modified" for files read after an edit (82% of files remembered).
 
 When the cache-shared summary cannot run, Pi's own summarizer is called through the session's model registry with the same choice to make. If that fails as well, Pi compacts on its own path, and the next compaction offers the messages again.
 
-Each compaction entry records `details.selfCompact`: `summary` is `"cache-shared"` (with `input` and `cacheRead`) or `"native"`, and `evidence` holds the index line and character counts, and `ledger` holds the kept message and character counts, whether the model chose (`selected: "model"`) or everything was kept (`"all"`), and the cumulative `dropped` ids. Entries without it are Pi's own summary.
+Each compaction entry records `details.selfCompact`: `summary` is `"cache-shared"` (with `input` and `cacheRead`) or `"native"`, and `ledger` holds the kept message and character counts, whether the model chose (`selected: "model"`) or everything was kept (`"all"`), and the cumulative `dropped` ids. Entries without it are Pi's own summary.
 
 The summary preserves the active objective, user corrections, constraints, completed
 and pending work, execution evidence, live jobs and next actions. Incomplete or
