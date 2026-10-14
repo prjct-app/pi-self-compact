@@ -1,5 +1,6 @@
 import type { CompactionResult, ExtensionAPI, ExtensionContext, SessionBeforeCompactResult } from '@earendil-works/pi-coding-agent';
 import { SUMMARY_PROMPT } from './prompts.ts';
+import { evidenceIndex, renderEvidence } from './evidence.ts';
 import { applySelection, collectLedger, droppedBefore, ledgerDetails, selectionInstructions, withLedger, type LedgerItem } from './ledger.ts';
 import { cachedSummaryBlocker, generateCachedSummary, generateNativeSummary, modelKey, type RequestSnapshot } from './summary.ts';
 
@@ -64,11 +65,14 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
     const dropped = droppedBefore(branch);
     const candidates = collectLedger(branch, event.preparation.firstKeptEntryId, dropped);
     const extra = selectionInstructions(candidates);
+    const reader = (pi.getActiveTools?.() ?? []).includes('memory_context') ? 'memory_context (action read, entryId)' : undefined;
+    const evidenceLines = evidenceIndex(branch, event.preparation.firstKeptEntryId, ctx.cwd);
+    const evidence = renderEvidence(evidenceLines, reader);
     const withUserMessages = (result: CompactionResult, summary: 'cache-shared' | 'native', more: object = {}): SessionBeforeCompactResult => {
       const selection = applySelection(result.summary, candidates, dropped);
-      return { compaction: { ...result, summary: withLedger(selection.summary, selection.items), details: {
+      return { compaction: { ...result, summary: withLedger(selection.summary, selection.items, evidence), details: {
         ...(result.details as object | undefined),
-        selfCompact: { summary, ...more, ledger: ledgerDetails(selection) },
+        selfCompact: { summary, ...more, ledger: ledgerDetails(selection), evidence: { lines: evidenceLines.length, characters: evidence.length } },
       } } };
     };
     const snapshot = R.snapshot;
@@ -95,7 +99,7 @@ const nativeWithLedger = async (
   event: Parameters<typeof generateNativeSummary>[0], ctx: ExtensionContext, candidates: readonly LedgerItem[], extra: string,
   wrap: (result: CompactionResult, summary: 'native') => SessionBeforeCompactResult,
 ): Promise<SessionBeforeCompactResult | undefined> => {
-  if (!candidates.length || event.signal.aborted) return undefined;
+  if (event.signal.aborted) return undefined;
   try {
     return wrap(await generateNativeSummary(event, ctx, extra), 'native');
   } catch {

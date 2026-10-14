@@ -14,6 +14,8 @@
  * stays in the journal, searchable, and is not offered again.
  */
 
+import { EVIDENCE_HEADER } from './evidence.ts';
+
 /** Longer messages (pasted logs, traces) keep this many characters and point at their entry. */
 export const LEDGER_MESSAGE_CHARS = 2_000;
 export const LEDGER_HEADER = '## User messages, verbatim (carried across compactions; newest last)';
@@ -54,24 +56,28 @@ export const renderLedger = (items: readonly LedgerItem[]): string => !items.len
 ].join('\n');
 
 const FILE_BLOCK = /\n*<(?:read|modified)-files>/u;
+const FILE_LISTS = /\n*<(read|modified)-files>[\s\S]*?<\/\1-files>/gu;
+/** Sections the host appends; a summarizer may echo them, and a summary never holds two. */
+const HOST_HEADERS = [LEDGER_HEADER, EVIDENCE_HEADER];
 
-/** Removes a carried ledger, so a summarizer is not asked to merge it and a summary never holds two. */
+/** Removes the host's sections, so a summarizer is not asked to merge them and a summary never holds two. */
 export const stripLedger = (summary: string): string => {
-  const at = summary.indexOf(LEDGER_HEADER);
-  if (at < 0) return summary;
+  const at = Math.min(...HOST_HEADERS.map(header => summary.indexOf(header)).filter(index => index >= 0));
+  if (!Number.isFinite(at)) return summary;
   const rest = summary.slice(at);
   const end = rest.search(FILE_BLOCK);
   return `${summary.slice(0, at).trimEnd()}${end < 0 ? '' : `\n\n${rest.slice(end).trimStart()}`}`;
 };
 
-/** The summary with the ledger placed after the prose and before Pi's file lists. */
-export const withLedger = (summary: string, items: readonly LedgerItem[]): string => {
-  const clean = stripLedger(summary);
-  const ledger = renderLedger(items);
-  if (!ledger) return clean;
+/** The summary with the ledger and the evidence index after the prose and before Pi's file lists. */
+export const withLedger = (summary: string, items: readonly LedgerItem[], evidence = ''): string => {
+  // The evidence index names the same files with ids: Pi's path-only lists would repeat them.
+  const clean = evidence ? stripLedger(summary).replace(FILE_LISTS, '').trimEnd() : stripLedger(summary);
+  const added = [renderLedger(items), evidence].filter(Boolean).join('\n\n');
+  if (!added) return clean;
   const at = clean.search(FILE_BLOCK);
-  return at < 0 ? `${clean.trimEnd()}\n\n${ledger}`
-    : `${clean.slice(0, at).trimEnd()}\n\n${ledger}\n\n${clean.slice(at).trimStart()}`;
+  return at < 0 ? `${clean.trimEnd()}\n\n${added}`
+    : `${clean.slice(0, at).trimEnd()}\n\n${added}\n\n${clean.slice(at).trimStart()}`;
 };
 
 type CompactionEntry = Readonly<{ type: string; details?: unknown }>;
