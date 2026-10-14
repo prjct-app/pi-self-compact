@@ -1,6 +1,6 @@
 ## Unreleased
 
-- Carry the user's own messages verbatim after every compaction summary, rebuilt from the session branch (not model-written). Messages over 2,000 characters keep their start and their entry id. No total or count limit; measured on 73 real sessions: median ~1k tokens, largest ~8k.
+- Carry the user's messages that still apply verbatim after every compaction summary. The summarizer names them by id in a `<keep-user-messages>` line, which the host removes; the text is copied from the session branch, never model-written. Dropped messages are not offered again and stay in the journal. Without a readable line every candidate is kept. Messages over 2,000 characters keep their start and their entry id.
 - Why: each summary merges the previous one, so a rule stated once was paraphrased on every pass. In a measured 21-compaction session "no sustituir pantallas por vistas simplificadas" was gone from the final summary and the agent shipped placeholder pages.
 - When the cache-shared summary cannot run, call Pi's summarizer through the session model registry (outbound data guarded, carried ledger removed from the previous summary) so those compactions carry the ledger too. A failure still leaves Pi's own compaction in charge. `details.selfCompact.summary` is `"cache-shared"` or `"native"`.
 

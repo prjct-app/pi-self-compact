@@ -9,7 +9,7 @@ before(async () => { privacyEnvironment.root = await mkdtemp(join(tmpdir(), 'pi-
 after(async () => { if (privacyEnvironment.previous === undefined) delete process.env.PRJCT_HOME; else process.env.PRJCT_HOME = privacyEnvironment.previous; await rm(privacyEnvironment.root, { recursive: true, force: true }); });
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { installSelfCompact } from '../src/index.ts';
-import { collectLedger, LEDGER_HEADER, stripLedger, withLedger } from '../src/ledger.ts';
+import { applySelection, collectLedger, droppedBefore, LEDGER_HEADER, selectionInstructions, stripLedger, withLedger } from '../src/ledger.ts';
 
 const user = (id: string, content: unknown, at = '2026-10-14T09:30:00.000Z') =>
   ({ type: 'message', id, timestamp: at, message: { role: 'user', content, timestamp: Date.parse(at) } });
@@ -91,7 +91,7 @@ test('overflow and other blocked cases still carry the ledger, through Pi\'s sum
   const registry = {
     streamSimple(_model: unknown, context: any) {
       sent.push(JSON.stringify(context));
-      return { result: async () => ({ role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: 'NATIVE SUMMARY' }],
+      return { result: async () => ({ role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: 'NATIVE SUMMARY\n<keep-user-messages>u1</keep-user-messages>' }],
         usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15 } }) };
     },
   };
@@ -103,6 +103,9 @@ test('overflow and other blocked cases still carry the ledger, through Pi\'s sum
   assert.match(result.compaction.summary, /^NATIVE SUMMARY\n\n## User messages, verbatim/u);
   assert.match(result.compaction.summary, /u1\] No toques producción/u);
   assert.equal(result.compaction.details.selfCompact.summary, 'native');
+  assert.equal(result.compaction.details.selfCompact.ledger.selected, 'model');
+  assert.doesNotMatch(result.compaction.summary, /keep-user-messages/u);
+  assert.match(sent[0]!, /keep-user-messages/u, 'Pi\'s summarizer is asked to choose too');
   assert.equal(result.compaction.firstKeptEntryId, 'u2');
 });
 
@@ -110,4 +113,25 @@ test('when Pi\'s summarizer fails too, Pi keeps its own compaction path', async 
   const failing = { streamSimple: () => ({ result: async () => { throw new Error('down'); } }) };
   assert.deepEqual(await host(failing).compact('overflow'), [undefined]);
   assert.deepEqual(await host(undefined).compact('overflow'), [undefined]);
+});
+
+test('the summarizer chooses which messages still apply; the host copies them, and dropped ones are not offered again', () => {
+  const branch: any[] = [user('u1', 'Regla: nunca despliegues sin autorización.'), user('u2', 'continua'), user('u3', 'arregla el login'), user('u4', 'kept')];
+  const candidates = collectLedger(branch, 'u4');
+  assert.match(selectionInstructions(candidates), /- u2: continua\n/u);
+  const first = applySelection('SUMMARY\n<keep-user-messages>u1 u3 bogus</keep-user-messages>', candidates, new Set());
+  assert.equal(first.summary, 'SUMMARY', 'the keep line never reaches the summary');
+  assert.deepEqual(first.items.map(item => item.entryId), ['u1', 'u3'], 'unknown ids are ignored');
+  assert.deepEqual(first.dropped, ['u2']);
+  assert.equal(first.items[0]!.text, 'Regla: nunca despliegues sin autorización.', 'kept words are the user\'s, not the model\'s');
+  branch.push({ type: 'compaction', id: 'k1', details: { selfCompact: { ledger: { dropped: first.dropped } } } }, user('u5', 'el login ya quedó'), user('u6', 'kept'));
+  const dropped = droppedBefore(branch);
+  const next = collectLedger(branch, 'u6', dropped);
+  assert.deepEqual(next.map(item => item.entryId), ['u1', 'u3', 'u4', 'u5'], 'a dropped message is not offered again');
+  const second = applySelection('S2 <keep-user-messages>u1</keep-user-messages>', next, dropped);
+  assert.deepEqual(second.dropped.sort(), ['u2', 'u3', 'u4', 'u5']);
+  const none = applySelection('S3', next, dropped);
+  assert.equal(none.selected, 'all', 'no keep line: nothing is lost');
+  assert.equal(none.items.length, 4);
+  assert.equal(applySelection('S4 <keep-user-messages></keep-user-messages>', next, dropped).items.length, 0, 'an explicit empty choice is respected');
 });

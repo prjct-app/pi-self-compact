@@ -34,24 +34,26 @@ Compaction is configured in Pi's `settings.json` (see Pi's `docs/compaction.md`)
 
 `reserveTokens` sets when Pi compacts (`contextWindow - reserveTokens`: about 232k on a 272k window). `keepRecentTokens` is the recent history kept verbatim; everything before it is replaced by the summary.
 
-## Your messages survive every compaction
+## Your messages that still apply survive every compaction
 
-Each compaction merges the previous summary, so in a session that compacts twenty times a rule stated on day one is paraphrased twenty times. In one measured session it was gone after 21 compactions, and the agent then did what it forbade. So every summary is followed by the user's own messages, verbatim:
+Each compaction merges the previous summary, so in a session that compacts twenty times a rule stated on day one is paraphrased twenty times. In one measured session it was gone after 21 compactions, and the agent then did what it forbade. Carrying every message forever is the opposite problem: finished tasks and "continue" would ride along for weeks.
+
+So the summarizer, the session's own model, is shown the user's messages by id and ends its summary with one line naming those that still apply (`<keep-user-messages>…</keep-user-messages>`). The host removes that line and appends the chosen messages verbatim, copied from the session branch:
 
 ```
 ## User messages, verbatim (carried across compactions; newest last)
-[2026-09-28 05:19 · 64606b1e] continua con el remplazo de supabase
-[2026-09-28 05:19 · 7a1c03f2] <first 2,000 characters> … [+12,345 chars; full text in session entry 7a1c03f2]
+[2026-10-14 07:02 · e7e259a3] Regla permanente para todo este proyecto: nunca hagas push ni deploy sin mi autorización…
 ```
 
-- Not model-written: the list is rebuilt from the session branch, which Pi never shortens, so it cannot drift and it recovers after any compaction that lacked it.
-- Only `user` messages before the kept history. Team and tool messages stay in the summary.
-- Messages over 2,000 characters (pasted logs) keep their start and point at their entry id; the full text stays in the session journal.
-- No total or count limit. Measured on 73 real sessions with 3+ compactions: median ~1k tokens, largest ~8k, all of it in the cached prefix after the compaction.
+- The model decides relevance; it never rewrites the words.
+- A dropped message is not offered again. It stays in the session journal, and pi-memory's `memory_context` reads it by id.
+- Without a readable keep line every candidate is carried, so a malformed summary never loses an instruction. An explicit empty line is respected.
+- Messages over 2,000 characters keep their start and point at their entry id.
+- In a live test (standing rule, a task that was finished, "continua", a second task, two compactions) the model kept only the standing rule both times, and the agent restated it exactly afterwards.
 
-When the cache-shared summary cannot run, Pi's own summarizer is called through the session's model registry so that summary carries the ledger too. If that fails as well, Pi compacts on its own path and the next compaction restores the ledger.
+When the cache-shared summary cannot run, Pi's own summarizer is called through the session's model registry with the same choice to make. If that fails as well, Pi compacts on its own path, and the next compaction offers the messages again.
 
-Each compaction entry records `details.selfCompact`: `summary` is `"cache-shared"` (with `input` and `cacheRead`) or `"native"`, and `ledger` holds the message and character counts. Entries without it are Pi's own summary.
+Each compaction entry records `details.selfCompact`: `summary` is `"cache-shared"` (with `input` and `cacheRead`) or `"native"`, and `ledger` holds the kept message and character counts, whether the model chose (`selected: "model"`) or everything was kept (`"all"`), and the cumulative `dropped` ids. Entries without it are Pi's own summary.
 
 The summary preserves the active objective, user corrections, constraints, completed
 and pending work, execution evidence, live jobs and next actions. Incomplete or

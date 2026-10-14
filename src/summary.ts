@@ -89,7 +89,7 @@ export const cachedSummaryBlocker = (
  */
 export const generateCachedSummary = async (
   event: SessionBeforeCompactEvent, ctx: ExtensionContext, system: string, snapshot: RequestSnapshot,
-  settings: Pick<ReturnType<ExtensionAPI['getSettings']>, 'thinkingBudgets'> = {},
+  settings: Pick<ReturnType<ExtensionAPI['getSettings']>, 'thinkingBudgets'> = {}, extra = '',
 ) => {
   const model = ctx.model;
   if (!model) throw new Error('No model available for compaction.');
@@ -99,6 +99,7 @@ export const generateCachedSummary = async (
     'Summarize the conversation above for the compaction. Reply with the summary text only and call no tools.',
     `Pi retains about ${preparation.settings.keepRecentTokens.toLocaleString('en-US')} recent tokens verbatim. Preserve the full active objective and unresolved constraints even if they appear in that recent part; avoid repeating routine tool output.`,
     event.customInstructions ? `Additional summarization instructions from the operator: ${event.customInstructions}` : '',
+    extra,
   ].filter(Boolean).join('\n\n');
   // System messages carry the prompt and tool declarations; pass them through untouched
   // (hosts before 0.87 drop them in convertToLlm).
@@ -155,7 +156,7 @@ type StreamOptions = Record<string, unknown> & { onPayload?: (body: unknown, mod
  * data like the cache-shared path, and drops the carried ledger from the
  * previous summary so the summarizer does not paraphrase it.
  */
-export const generateNativeSummary = async (event: SessionBeforeCompactEvent, ctx: ExtensionContext) => {
+export const generateNativeSummary = async (event: SessionBeforeCompactEvent, ctx: ExtensionContext, extra = '') => {
   const model = ctx.model;
   if (!model) throw new Error('No model available for compaction.');
   const registry = ctx.modelRegistry as Registry<StreamOptions>;
@@ -178,7 +179,7 @@ export const generateNativeSummary = async (event: SessionBeforeCompactEvent, ct
   const reasoning = model.reasoning && ctx.thinkingLevel && ctx.thinkingLevel !== 'off' ? ctx.thinkingLevel : undefined;
   return compact(
     { ...preparation, previousSummary: preparation.previousSummary === undefined ? undefined : stripLedger(preparation.previousSummary) },
-    model, undefined, undefined, event.customInstructions, event.signal, reasoning,
+    model, undefined, undefined, [event.customInstructions, extra].filter(Boolean).join('\n\n') || undefined, event.signal, reasoning,
     stream as unknown as Parameters<typeof compact>[7], undefined, undefined, undefined, ctx.sessionManager.getSessionId(),
   );
 };
