@@ -134,3 +134,16 @@ export const stateDetails = (state: ProjectState, rendered: string) => ({
   rules: live(state).filter(item => item.kind === 'rule').length,
   characters: rendered.length,
 });
+
+/**
+ * The user's latest message, verbatim, when the compaction cuts it out of the
+ * kept history. Without it, a compaction in the middle of a task left the
+ * agent with the rules and the facts but not what it was asked to do now.
+ */
+export const currentRequest = (branch: readonly Entry[], firstKeptEntryId: string, users: ReadonlyMap<string, string>): string => {
+  const cut = branch.findIndex(entry => entry.id === firstKeptEntryId);
+  const lastUser = [...branch].reverse().find(entry => entry.type === 'message' && entry.message?.role === 'user');
+  if (!lastUser || (cut >= 0 && branch.indexOf(lastUser) >= cut)) return '';
+  const text = (users.get(lastUser.id) ?? '').slice(0, 4_000);
+  return text ? `### Current request (user message ${lastUser.id}, verbatim; the work on it continues below)\n${text}` : '';
+};

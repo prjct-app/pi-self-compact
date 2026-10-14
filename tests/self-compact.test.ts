@@ -76,7 +76,7 @@ test('adds nothing the model sees: no tool, no flag, no command, no context or t
   const h = host(cwd);
   assert.equal(installSelfCompact(h.pi), true);
   assert.deepEqual(h.registered, []);
-  for (const name of ['context', 'tool_call', 'before_agent_start', 'turn_end', 'agent_settled']) {
+  for (const name of ['context', 'tool_call', 'before_agent_start', 'agent_settled']) {
     assert.equal(h.handlers.has(name), false, `${name} is not hooked`);
   }
   await h.emit('session_start', { reason: 'startup' });

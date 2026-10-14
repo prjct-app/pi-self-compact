@@ -44,6 +44,19 @@ Long sessions compact many times, and rewriting the summary on each pass loses t
 - **Stored as a custom entry** (`self-compact-state`), never sent to the model as a message. Sessions that predate the state start from their last compaction summary.
 - **Fallback.** If the state cannot be updated (no model answer, malformed edits), the compaction writes a summary followed by the user's messages that still apply, as described below.
 
+- **The current request survives.** When a compaction cuts the user's latest message out of the kept history (a cut in the middle of a task), that message goes into the summary verbatim. Without it, a live test lost the task and the agent answered "Entendido." instead of the result.
+
+## When to compact: calibrated per model, on every machine
+
+Models degrade at different context sizes, so one threshold is wrong for some of them, and a table of model ids would not know the models a user actually runs. pi-self-compact measures it on each machine's own sessions:
+
+- The session journals are scanned incrementally in the background (8 s for 2.4 GB the first time, 0.1 s after that) into failed edits (the edit text did not match the file) per model and 50k context band. Counts live in `<agent dir>/self-compact/calibration.json`.
+- A model's threshold is the start of the first band from 100k where failed edits rise at least 1.5x and 3 points over its own rate below 100k, and stay up in the next band. With too little data (fewer than 60 edits below 100k, or 40 in a band) or no such rise, nothing changes and Pi's own threshold applies.
+- At a turn boundary past the threshold, the state is brought up to date and proposed as the compaction through Pi's `turn_end` / `agent_before_settle` boundaries, keeping Pi's `keepRecentTokens`. It is skipped when the kept history would still be most of the context, so a tail of huge tool results cannot trigger it twice.
+- Pi's own trigger (`compaction.reserveTokens`, per-model overrides in settings) still applies as before; the calibrated threshold only ever compacts earlier, never later.
+
+On the author's sessions this found MiniMax-M3 degrading from 200k (failed edits 13% → 19% → 30%) and left the models without a clear rise on Pi's threshold. In a live test with a calibrated threshold of 100k, the context went from 114k to 10k in the middle of a task, the agent finished the task and restated the user's rule.
+
 Measured by replaying three real long sessions (21, 23 and 17 compactions; the final context answered 26 fixed questions three times, including rules never stated and files never touched):
 
 | | Summary chain | Summary + kept user messages | Project state |

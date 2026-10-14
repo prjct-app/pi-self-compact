@@ -9,7 +9,7 @@ before(async () => { privacyEnvironment.root = await mkdtemp(join(tmpdir(), 'pi-
 after(async () => { if (privacyEnvironment.previous === undefined) delete process.env.PRJCT_HOME; else process.env.PRJCT_HOME = privacyEnvironment.previous; await rm(privacyEnvironment.root, { recursive: true, force: true }); });
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { installSelfCompact } from '../src/index.ts';
-import { applyOps, EMPTY_STATE, parseOps, renderState, restoreState, STATE_ENTRY, STATE_HEADER, unfolded, userMessages } from '../src/state.ts';
+import { applyOps, currentRequest, EMPTY_STATE, parseOps, renderState, restoreState, STATE_ENTRY, STATE_HEADER, unfolded, userMessages } from '../src/state.ts';
 
 const user = (id: string, text: string, ts = '2026-10-14T10:00:00.000Z') => ({ type: 'message', id, timestamp: ts, message: { role: 'user', content: text, timestamp: Date.parse(ts) } });
 const assistant = (id: string, text: string) => ({ type: 'message', id, timestamp: '2026-10-14T10:01:00.000Z',
@@ -111,4 +111,12 @@ test('when the state cannot be updated, the summary path still compacts', async 
   const [result] = await h.emit('session_before_compact', { reason: 'overflow', preparation, signal: new AbortController().signal });
   assert.equal(result.compaction.details.selfCompact.summary, 'native');
   assert.match(result.compaction.summary, /^SUMMARY TEXT/u);
+});
+
+test('the current request is carried only when the cut leaves it out', () => {
+  const branch: any[] = [user('u1', 'cuenta las líneas de big.txt'), assistant('a1', 'leyendo'), assistant('a2', 'sigo')];
+  const users = userMessages(branch);
+  assert.match(currentRequest(branch, 'a2', users), /^### Current request \(user message u1, verbatim[^\n]*\ncuenta las líneas de big\.txt$/u);
+  assert.equal(currentRequest(branch, 'u1', users), '', 'already in the kept history');
+  assert.equal(currentRequest([assistant('a1', 'x')], 'a1', new Map()), '');
 });

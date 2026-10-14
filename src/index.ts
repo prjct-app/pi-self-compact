@@ -1,10 +1,11 @@
-import { convertToLlm, serializeConversation, type CompactionResult, type ExtensionAPI, type ExtensionContext, type SessionBeforeCompactResult } from '@earendil-works/pi-coding-agent';
+import { convertToLlm, estimateTokens, findCutPoint, getAgentDir, serializeConversation, SettingsManager, type CompactionResult, type ExtensionAPI, type ExtensionContext, type SessionBeforeCompactResult } from '@earendil-works/pi-coding-agent';
+import { EMPTY_CALIBRATION, thresholdFor, updateCalibration, type Calibration } from './calibrate.ts';
 import { SUMMARY_PROMPT } from './prompts.ts';
 import { branchFileOps } from './files.ts';
 import { applySelection, collectLedger, droppedBefore, ledgerDetails, selectionInstructions, withLedger } from './ledger.ts';
 import { askCached, askPlain, cachedSummaryBlocker, fileLists, generateCachedSummary, generateNativeSummary, modelKey, snapshotBlocker, type RequestSnapshot } from './summary.ts';
 import {
-  applyOps, foldTask, parseOps, renderState, restoreState, REVIEW_CHARS, reviewTask, STATE_ENTRY, stateDetails, unfolded, userMessages,
+  applyOps, currentRequest, foldTask, parseOps, renderState, restoreState, REVIEW_CHARS, reviewTask, STATE_ENTRY, stateDetails, unfolded, userMessages,
   type ProjectState,
 } from './state.ts';
 
@@ -28,7 +29,7 @@ import {
  * compaction.
  */
 
-export type SelfCompactOptions = Readonly<{ enabled?: boolean }>;
+export type SelfCompactOptions = Readonly<{ enabled?: boolean; agentDir?: string; calibrationDelayMs?: number }>;
 
 export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions = {}): boolean => {
   if (options.enabled === false) return false;
@@ -40,6 +41,10 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
     state: undefined as ProjectState | undefined,
     /** State updates run one at a time, in order. */
     folding: Promise.resolve() as Promise<unknown>,
+    /** Per-model thresholds measured on this machine's journals (see calibrate.ts). */
+    calibration: EMPTY_CALIBRATION as Calibration,
+    calibrating: false,
+    proposing: false,
   };
   const reset = (): void => { R.snapshot = undefined; };
   const notify = (ctx: ExtensionContext, message: string): void => {
@@ -48,7 +53,17 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
     try { ctx.ui.notify(message, 'warning'); } catch { /* UI only. */ }
   };
 
-  pi.on('session_start', async () => { reset(); R.state = undefined; });
+  pi.on('session_start', async () => {
+    reset();
+    R.state = undefined;
+    if (R.calibrating) return;
+    R.calibrating = true;
+    // In the background, a few seconds in: startup never waits on it.
+    setTimeout(() => {
+      void updateCalibration(options.agentDir ?? getAgentDir()).then(next => { R.calibration = next; }, () => undefined)
+        .finally(() => { R.calibrating = false; });
+    }, options.calibrationDelayMs ?? 5_000).unref?.();
+  });
   pi.on('session_tree', async () => { reset(); R.state = undefined; });
   pi.on('session_compact', async () => reset());
 
@@ -140,6 +155,53 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
     void queueUpdate(ctx).catch(error => notify(ctx, `self-compact: project state not updated (${error instanceof Error ? error.message : String(error)})`));
   });
 
+  /**
+   * The calibrated threshold, when it is below Pi's own: at a turn boundary past it, the state is
+   * brought up to date and proposed as the compaction, so the next request starts lighter.
+   */
+  const proposeCompaction = async (event: { entries: unknown[] }, ctx: ExtensionContext) => {
+    const model = ctx.model;
+    if (!model || R.proposing) return undefined;
+    const threshold = thresholdFor(R.calibration.models[modelKey(model)]);
+    const tokens = ctx.getContextUsage()?.tokens ?? 0;
+    const compaction = SettingsManager.inMemory(pi.getSettings?.() ?? {}).getCompactionSettings(model);
+    if (!threshold || !compaction.enabled || tokens < threshold || threshold >= model.contextWindow - compaction.reserveTokens) return undefined;
+    R.proposing = true;
+    try {
+      const state = await queueUpdate(ctx);
+      const branch = ctx.sessionManager.getBranch() as Parameters<typeof findCutPoint>[0];
+      const users = userMessages(branch as Branch);
+      const rendered = renderState(state, users);
+      if (!rendered) return undefined;
+      const previous = [...branch].reverse().find(entry => entry.type === 'compaction') as { firstKeptEntryId?: string } | undefined;
+      const start = Math.max(0, previous?.firstKeptEntryId ? branch.findIndex(entry => entry.id === previous.firstKeptEntryId) : 0);
+      const cut = findCutPoint(branch, start, branch.length, compaction.keepRecentTokens);
+      const kept = branch[cut.firstKeptEntryIndex];
+      if (!kept || cut.firstKeptEntryIndex <= start) return undefined;
+      // Only worth it when most of the context goes: a kept tail of huge tool results would trigger again at once.
+      const keptTokens = branch.slice(cut.firstKeptEntryIndex)
+        .reduce((sum, entry) => sum + (entry.type === 'message' ? estimateTokens(entry.message as Parameters<typeof estimateTokens>[0]) : 0), 0);
+      if (keptTokens > tokens * 0.5) return undefined;
+      const files = fileLists(branchFileOps(branch as Parameters<typeof branchFileOps>[0], kept.id));
+      const request = currentRequest(branch as Branch, kept.id, users);
+      const body = [rendered, request].filter(Boolean).join('\n\n');
+      return { entries: [...event.entries, {
+        type: 'compaction' as const,
+        summary: files.text ? `${body}\n\n${files.text}` : body,
+        firstKeptEntryId: kept.id,
+        details: { readFiles: files.readFiles, modifiedFiles: files.modifiedFiles,
+          selfCompact: { summary: 'state', trigger: 'calibrated', threshold, tokensBefore: tokens, state: stateDetails(state, rendered) } },
+      }] };
+    } catch (error) {
+      notify(ctx, `self-compact: calibrated compaction skipped (${error instanceof Error ? error.message : String(error)})`);
+      return undefined;
+    } finally {
+      R.proposing = false;
+    }
+  };
+  (pi.on as (event: string, handler: (event: { entries: unknown[] }, ctx: ExtensionContext) => Promise<unknown>) => void)('turn_end', proposeCompaction);
+  (pi.on as (event: string, handler: (event: { entries: unknown[] }, ctx: ExtensionContext) => Promise<unknown>) => void)('agent_before_settle', proposeCompaction);
+
   pi.on('session_before_compact', async (event, ctx) => {
     const branch = ctx.sessionManager.getBranch() as Parameters<typeof collectLedger>[0] & Parameters<typeof droppedBefore>[0];
     const dropped = droppedBefore(branch);
@@ -158,11 +220,14 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
     // The project state is the summary: no summary of a summary.
     try {
       const state = await queueUpdate(ctx, event.signal, event.reason !== 'overflow');
-      const rendered = renderState(state, userMessages(branch as Parameters<typeof userMessages>[0]));
+      const users = userMessages(branch as Parameters<typeof userMessages>[0]);
+      const rendered = renderState(state, users);
       if (rendered && !event.signal.aborted) {
         const files = fileLists(withFiles.preparation.fileOps);
+        const request = currentRequest(branch as Parameters<typeof currentRequest>[0], event.preparation.firstKeptEntryId, users);
+        const body = [rendered, request].filter(Boolean).join('\n\n');
         return { compaction: {
-          summary: files.text ? `${rendered}\n\n${files.text}` : rendered,
+          summary: files.text ? `${body}\n\n${files.text}` : body,
           firstKeptEntryId: event.preparation.firstKeptEntryId,
           tokensBefore: event.preparation.tokensBefore,
           details: { readFiles: files.readFiles, modifiedFiles: files.modifiedFiles, selfCompact: { summary: 'state', state: stateDetails(state, rendered) } },
