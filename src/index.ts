@@ -1,7 +1,7 @@
 import type { CompactionResult, ExtensionAPI, ExtensionContext, SessionBeforeCompactResult } from '@earendil-works/pi-coding-agent';
 import { SUMMARY_PROMPT } from './prompts.ts';
-import { evidenceIndex, renderEvidence } from './evidence.ts';
-import { applySelection, collectLedger, droppedBefore, ledgerDetails, selectionInstructions, withLedger, type LedgerItem } from './ledger.ts';
+import { branchFileOps } from './files.ts';
+import { applySelection, collectLedger, droppedBefore, ledgerDetails, selectionInstructions, withLedger } from './ledger.ts';
 import { cachedSummaryBlocker, generateCachedSummary, generateNativeSummary, modelKey, type RequestSnapshot } from './summary.ts';
 
 /**
@@ -65,38 +65,39 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
     const dropped = droppedBefore(branch);
     const candidates = collectLedger(branch, event.preparation.firstKeptEntryId, dropped);
     const extra = selectionInstructions(candidates);
-    const reader = (pi.getActiveTools?.() ?? []).includes('memory_context') ? 'memory_context (action read, entryId)' : undefined;
-    const evidenceLines = evidenceIndex(branch, event.preparation.firstKeptEntryId, ctx.cwd);
-    const evidence = renderEvidence(evidenceLines, reader);
+    // File lists for the whole session, not just this span: Pi skips the lists of summaries an extension wrote.
+    const withFiles = { ...event, preparation: { ...event.preparation,
+      fileOps: branchFileOps(branch as Parameters<typeof branchFileOps>[0], event.preparation.firstKeptEntryId, event.preparation.fileOps) } };
     const withUserMessages = (result: CompactionResult, summary: 'cache-shared' | 'native', more: object = {}): SessionBeforeCompactResult => {
       const selection = applySelection(result.summary, candidates, dropped);
-      return { compaction: { ...result, summary: withLedger(selection.summary, selection.items, evidence), details: {
+      return { compaction: { ...result, summary: withLedger(selection.summary, selection.items), details: {
         ...(result.details as object | undefined),
-        selfCompact: { summary, ...more, ledger: ledgerDetails(selection), evidence: { lines: evidenceLines.length, characters: evidence.length } },
+        selfCompact: { summary, ...more, ledger: ledgerDetails(selection) },
       } } };
     };
     const snapshot = R.snapshot;
     if (snapshot && !cachedSummaryBlocker(event, ctx, snapshot, ctx.getContextUsage()?.tokens ?? null)) {
       try {
-        const result = await generateCachedSummary(event, ctx, SUMMARY_PROMPT, snapshot, pi.getSettings?.() ?? {}, extra);
+        const result = await generateCachedSummary(withFiles, ctx, SUMMARY_PROMPT, snapshot, pi.getSettings?.() ?? {}, extra);
         return withUserMessages(result, 'cache-shared', { input: result.usage.input, cacheRead: result.usage.cacheRead });
       } catch (error) {
         if (event.signal.aborted) return undefined;
         notify(ctx, `self-compact: cache-shared summary failed, Pi's summarizer writes it (${error instanceof Error ? error.message : String(error)})`);
       }
     }
-    return nativeWithLedger(event, ctx, candidates, extra, withUserMessages);
+    return nativeWithLedger(withFiles, ctx, extra, withUserMessages);
   });
 
   return true;
 };
 
 /**
- * Pi's summarizer plus the ledger. If even that fails, Pi compacts on its own
- * path and the next compaction restores the ledger from the branch.
+ * Pi's summarizer plus the ledger and the session's file lists. If even that
+ * fails, Pi compacts on its own path and the next compaction restores both
+ * from the branch.
  */
 const nativeWithLedger = async (
-  event: Parameters<typeof generateNativeSummary>[0], ctx: ExtensionContext, candidates: readonly LedgerItem[], extra: string,
+  event: Parameters<typeof generateNativeSummary>[0], ctx: ExtensionContext, extra: string,
   wrap: (result: CompactionResult, summary: 'native') => SessionBeforeCompactResult,
 ): Promise<SessionBeforeCompactResult | undefined> => {
   if (event.signal.aborted) return undefined;
