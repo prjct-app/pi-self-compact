@@ -1,3 +1,16 @@
+## [0.5.0](https://github.com/prjct-app/pi-self-compact/compare/v0.4.2...v0.5.0) (2026-10-14)
+
+### Features
+
+* carry the user's messages verbatim across compactions ([ffc1df2](https://github.com/prjct-app/pi-self-compact/commit/ffc1df2f086af96108b44286c9212d8e435dca17))
+* index the session's evidence by entry id in every summary ([18c5fdc](https://github.com/prjct-app/pi-self-compact/commit/18c5fdc5259352a54389903914c9a82e97d694e4))
+* the summarizer chooses which user messages still apply ([6fbccf7](https://github.com/prjct-app/pi-self-compact/commit/6fbccf7a75592e9f39b0e8c5b22e615b2bd20605))
+
+### Bug Fixes
+
+* carry session file lists; drop the evidence index ([aae473a](https://github.com/prjct-app/pi-self-compact/commit/aae473a5753cee97df123196e787f6fb60f74b55))
+* never carry an expanded skill as a user message ([0a64d7f](https://github.com/prjct-app/pi-self-compact/commit/0a64d7f2bf68f838368c4594e1a845f593505d43))
+
 ## Unreleased
 
 - Rebuild `<read-files>`/`<modified-files>` from the session branch: Pi skips the lists of summaries an extension wrote, so after a cache-shared compaction earlier files vanished and the model denied having read them.

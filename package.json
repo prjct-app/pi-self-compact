@@ -1,6 +1,6 @@
 {
   "name": "@prjct.app/pi-self-compact",
-  "version": "0.4.2",
+  "version": "0.5.0",
   "description": "Pi extension: Pi's compaction summary, written by extending the session's cached request. Adds nothing to the context.",
   "type": "module",
   "license": "MIT",
