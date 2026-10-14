@@ -1,8 +1,9 @@
 import {
-  convertToLlm, type ExtensionAPI, type ExtensionContext, type SessionBeforeCompactEvent,
+  compact, convertToLlm, type ExtensionAPI, type ExtensionContext, type SessionBeforeCompactEvent,
 } from '@earendil-works/pi-coding-agent';
 import { contentText, type Context } from '@earendil-works/pi-ai';
 import { protectOutboundData } from '@prjct.app/pi-secrets/privacy';
+import { stripLedger } from './ledger.ts';
 
 /**
  * The compaction summary, written by extending the session's last request
@@ -44,6 +45,11 @@ export const extendPayload = (session: unknown, rebuilt: unknown): unknown => {
   const { max_output_tokens: maxOutput } = rebuilt;
   return { ...session, input: [...session.input, ...rebuilt.input.slice(at + 1)], tool_choice: 'none',
     ...(maxOutput === undefined ? {} : { max_output_tokens: maxOutput }) };
+};
+
+// The session streams through streamSimple (Pi 0.87+); older hosts only offer complete().
+type Registry<O> = ExtensionContext['modelRegistry'] & {
+  streamSimple?: (m: NonNullable<ExtensionContext['model']>, c: Context, o: O) => { result(): ReturnType<ExtensionContext['modelRegistry']['complete']> };
 };
 
 export const modelKey = (model: { provider: string; id: string }): string => `${model.provider}/${model.id}`;
@@ -112,11 +118,7 @@ export const generateCachedSummary = async (
     // Guard both them and the reused provider body before this auxiliary call.
     onPayload: async (body: unknown) => protectOutboundData(extendPayload(snapshot.payload, body) ?? body),
   };
-  // The session streams through streamSimple (Pi 0.87+); older hosts only offer complete().
-  type Registry = typeof ctx.modelRegistry & {
-    streamSimple?: (m: typeof model, c: Context, o: typeof options) => { result(): ReturnType<typeof ctx.modelRegistry.complete> };
-  };
-  const registry = ctx.modelRegistry as Registry;
+  const registry = ctx.modelRegistry as Registry<typeof options>;
   const response = registry.streamSimple
     ? await registry.streamSimple(model, context, options).result()
     : await ctx.modelRegistry.complete(model, context, options);
@@ -141,4 +143,42 @@ export const generateCachedSummary = async (
     usage: response.usage,
     details: { readFiles, modifiedFiles },
   };
+};
+
+type StreamOptions = Record<string, unknown> & { onPayload?: (body: unknown, model?: unknown) => unknown };
+
+/**
+ * Pi's own summarizer, for the compactions the cache-shared request cannot
+ * write (overflow, a model change, a stale snapshot, a failed request), so
+ * those summaries carry the user's messages too. It streams through the
+ * session's model registry with request-time authentication, guards outbound
+ * data like the cache-shared path, and drops the carried ledger from the
+ * previous summary so the summarizer does not paraphrase it.
+ */
+export const generateNativeSummary = async (event: SessionBeforeCompactEvent, ctx: ExtensionContext) => {
+  const model = ctx.model;
+  if (!model) throw new Error('No model available for compaction.');
+  const registry = ctx.modelRegistry as Registry<StreamOptions>;
+  const streamSimple = registry?.streamSimple?.bind(registry);
+  if (!streamSimple) throw new Error('This Pi host has no streamSimple.');
+  const { preparation } = event;
+  // Only a finished text answer may replace the conversation; anything else leaves Pi in charge.
+  const stream = async (m: typeof model, context: Context, options: StreamOptions = {}) => {
+    const response = streamSimple(m, await protectOutboundData(context), {
+      ...options,
+      onPayload: async (body: unknown, payloadModel?: unknown) =>
+        protectOutboundData((await options.onPayload?.(body, payloadModel)) ?? body),
+    });
+    return { result: async () => {
+      const message = await response.result();
+      if (message.stopReason !== 'stop') throw new Error(`Incomplete compaction summary (${message.stopReason}).`);
+      return message;
+    } };
+  };
+  const reasoning = model.reasoning && ctx.thinkingLevel && ctx.thinkingLevel !== 'off' ? ctx.thinkingLevel : undefined;
+  return compact(
+    { ...preparation, previousSummary: preparation.previousSummary === undefined ? undefined : stripLedger(preparation.previousSummary) },
+    model, undefined, undefined, event.customInstructions, event.signal, reasoning,
+    stream as unknown as Parameters<typeof compact>[7], undefined, undefined, undefined, ctx.sessionManager.getSessionId(),
+  );
 };

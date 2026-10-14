@@ -7,7 +7,7 @@ Pi decides when to compact and how much recent history stays verbatim. This exte
 - **Cheaper.** The provider bills the shared prefix as cached input. Measured on Codex: about 10.7k uncached input tokens per compaction, against about 72k for Pi's replayed summary.
 - **Better input.** The summarizer reads every tool result whole; Pi's replay cuts each one to 2,000 characters.
 
-It adds nothing to the context: no tool, no guidance messages, no notes, no locks, no commands. When the cached summary cannot run (overflow recovery, a model change since the last request, a stale snapshot, a provider error), Pi writes its own summary.
+It adds nothing to the context: no tool, no guidance messages, no notes, no locks, no commands. When the cached summary cannot run (overflow recovery, a model change since the last request, a stale snapshot, a provider error), Pi's own summarizer writes it.
 
 Adapted from [disler/self-compact-pi-agent](https://github.com/disler/self-compact-pi-agent) (MIT); see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
@@ -34,7 +34,24 @@ Compaction is configured in Pi's `settings.json` (see Pi's `docs/compaction.md`)
 
 `reserveTokens` sets when Pi compacts (`contextWindow - reserveTokens`: about 232k on a 272k window). `keepRecentTokens` is the recent history kept verbatim; everything before it is replaced by the summary.
 
-Each compaction entry records `details.selfCompact` with `summary: "cache-shared"`, `input` and `cacheRead`. Entries without it are Pi's own summary.
+## Your messages survive every compaction
+
+Each compaction merges the previous summary, so in a session that compacts twenty times a rule stated on day one is paraphrased twenty times. In one measured session it was gone after 21 compactions, and the agent then did what it forbade. So every summary is followed by the user's own messages, verbatim:
+
+```
+## User messages, verbatim (carried across compactions; newest last)
+[2026-09-28 05:19 · 64606b1e] continua con el remplazo de supabase
+[2026-09-28 05:19 · 7a1c03f2] <first 2,000 characters> … [+12,345 chars; full text in session entry 7a1c03f2]
+```
+
+- Not model-written: the list is rebuilt from the session branch, which Pi never shortens, so it cannot drift and it recovers after any compaction that lacked it.
+- Only `user` messages before the kept history. Team and tool messages stay in the summary.
+- Messages over 2,000 characters (pasted logs) keep their start and point at their entry id; the full text stays in the session journal.
+- No total or count limit. Measured on 73 real sessions with 3+ compactions: median ~1k tokens, largest ~8k, all of it in the cached prefix after the compaction.
+
+When the cache-shared summary cannot run, Pi's own summarizer is called through the session's model registry so that summary carries the ledger too. If that fails as well, Pi compacts on its own path and the next compaction restores the ledger.
+
+Each compaction entry records `details.selfCompact`: `summary` is `"cache-shared"` (with `input` and `cacheRead`) or `"native"`, and `ledger` holds the message and character counts. Entries without it are Pi's own summary.
 
 The summary preserves the active objective, user corrections, constraints, completed
 and pending work, execution evidence, live jobs and next actions. Incomplete or
