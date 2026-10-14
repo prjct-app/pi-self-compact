@@ -1,3 +1,9 @@
+## [0.7.0](https://github.com/prjct-app/pi-self-compact/compare/v0.6.0...v0.7.0) (2026-10-14)
+
+### Features
+
+* compact at a per-model threshold calibrated on each machine's sessions ([f3ba7ae](https://github.com/prjct-app/pi-self-compact/commit/f3ba7ae5ac82440fa6d03ee618e7d9cb7857adb1))
+
 ## [0.6.0](https://github.com/prjct-app/pi-self-compact/compare/v0.5.0...v0.6.0) (2026-10-14)
 
 ### Features
