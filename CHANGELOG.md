@@ -1,3 +1,9 @@
+## [0.6.0](https://github.com/prjct-app/pi-self-compact/compare/v0.5.0...v0.6.0) (2026-10-14)
+
+### Features
+
+* the compaction summary is a project state edited item by item ([ee8f2a9](https://github.com/prjct-app/pi-self-compact/commit/ee8f2a9409111053976a4f04a66d6b5c04bdc4f3))
+
 ## [0.5.0](https://github.com/prjct-app/pi-self-compact/compare/v0.4.2...v0.5.0) (2026-10-14)
 
 ### Features
