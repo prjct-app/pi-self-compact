@@ -1,6 +1,7 @@
-import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
+import type { CompactionResult, ExtensionAPI, ExtensionContext, SessionBeforeCompactResult } from '@earendil-works/pi-coding-agent';
 import { SUMMARY_PROMPT } from './prompts.ts';
-import { cachedSummaryBlocker, generateCachedSummary, modelKey, type RequestSnapshot } from './summary.ts';
+import { collectLedger, ledgerDetails, withLedger, type LedgerItem } from './ledger.ts';
+import { cachedSummaryBlocker, generateCachedSummary, generateNativeSummary, modelKey, type RequestSnapshot } from './summary.ts';
 
 /**
  * Pi decides when to compact (`compaction.reserveTokens`) and how much recent
@@ -8,7 +9,10 @@ import { cachedSummaryBlocker, generateCachedSummary, modelKey, type RequestSnap
  * writes the summary: it extends the session's last request, so the provider
  * bills the shared prefix as cached input and the summarizer reads every tool
  * result whole. When that cannot run (overflow, a model change, a stale
- * snapshot, an error) Pi writes its own summary.
+ * snapshot, an error) it runs Pi's own summarizer.
+ *
+ * Either summary is followed by the user's messages, verbatim (see ledger.ts):
+ * the summary is rewritten on every compaction, the user's words are not.
  *
  * It adds nothing to the context: no tool, no guidance, no notes, no locks.
  * Asking the model to write its own handoff note under a character cap made
@@ -56,21 +60,43 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
   });
 
   pi.on('session_before_compact', async (event, ctx) => {
+    const ledger = collectLedger(ctx.sessionManager.getBranch() as Parameters<typeof collectLedger>[0], event.preparation.firstKeptEntryId);
+    const withUserMessages = (result: CompactionResult, summary: 'cache-shared' | 'native', extra: object = {}): SessionBeforeCompactResult => ({
+      compaction: { ...result, summary: withLedger(result.summary, ledger), details: {
+        ...(result.details as object | undefined),
+        selfCompact: { summary, ...extra, ledger: ledgerDetails(ledger) },
+      } },
+    });
     const snapshot = R.snapshot;
-    if (!snapshot || cachedSummaryBlocker(event, ctx, snapshot, ctx.getContextUsage()?.tokens ?? null)) return undefined;
-    try {
-      const result = await generateCachedSummary(event, ctx, SUMMARY_PROMPT, snapshot, pi.getSettings?.() ?? {});
-      return { compaction: { ...result, details: {
-        ...result.details,
-        selfCompact: { summary: 'cache-shared', input: result.usage.input, cacheRead: result.usage.cacheRead },
-      } } };
-    } catch (error) {
-      if (!event.signal.aborted) notify(ctx, `self-compact: cache-shared summary failed, Pi writes its own (${error instanceof Error ? error.message : String(error)})`);
-      return undefined;
+    if (snapshot && !cachedSummaryBlocker(event, ctx, snapshot, ctx.getContextUsage()?.tokens ?? null)) {
+      try {
+        const result = await generateCachedSummary(event, ctx, SUMMARY_PROMPT, snapshot, pi.getSettings?.() ?? {});
+        return withUserMessages(result, 'cache-shared', { input: result.usage.input, cacheRead: result.usage.cacheRead });
+      } catch (error) {
+        if (event.signal.aborted) return undefined;
+        notify(ctx, `self-compact: cache-shared summary failed, Pi's summarizer writes it (${error instanceof Error ? error.message : String(error)})`);
+      }
     }
+    return nativeWithLedger(event, ctx, ledger, withUserMessages);
   });
 
   return true;
+};
+
+/**
+ * Pi's summarizer plus the ledger. If even that fails, Pi compacts on its own
+ * path and the next compaction restores the ledger from the branch.
+ */
+const nativeWithLedger = async (
+  event: Parameters<typeof generateNativeSummary>[0], ctx: ExtensionContext, ledger: readonly LedgerItem[],
+  wrap: (result: CompactionResult, summary: 'native') => SessionBeforeCompactResult,
+): Promise<SessionBeforeCompactResult | undefined> => {
+  if (!ledger.length || event.signal.aborted) return undefined;
+  try {
+    return wrap(await generateNativeSummary(event, ctx), 'native');
+  } catch {
+    return undefined;
+  }
 };
 
 export default function selfCompact(pi: ExtensionAPI): void {

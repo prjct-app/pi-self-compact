@@ -9,6 +9,7 @@ before(async () => { privacyEnvironment.root = await mkdtemp(join(tmpdir(), 'pi-
 after(async () => { if (privacyEnvironment.previous === undefined) delete process.env.PRJCT_HOME; else process.env.PRJCT_HOME = privacyEnvironment.previous; await rm(privacyEnvironment.root, { recursive: true, force: true }); });
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { installSelfCompact } from '../src/index.ts';
+import { LEDGER_HEADER } from '../src/ledger.ts';
 import { SUMMARY_PROMPT } from '../src/prompts.ts';
 import { cachedSummaryBlocker, extendPayload } from '../src/summary.ts';
 
@@ -114,13 +115,16 @@ test('an automatic compaction gets the summary that extends the cached session r
   assert.equal(options.toolChoice, 'none', 'all providers must produce text, not tool calls');
   assert.equal(options.reasoning, 'high', 'the active reasoning level is preserved');
   assert.deepEqual(options.thinkingBudgets, { high: 21000 }, 'custom reasoning budgets are also preserved');
-  assert.equal(result.compaction.summary, 'SUMMARY\n\n<read-files>\na.ts\n</read-files>\n\n<modified-files>\nb.ts\n</modified-files>');
+  const ledger = `${LEDGER_HEADER}\n[${h.entries[0].timestamp.slice(0, 16).replace('T', ' ')} · u1] ${'x'.repeat(2000)} … [+198,000 chars; full text in session entry u1]`;
+  assert.equal(result.compaction.summary, `SUMMARY\n\n${ledger}\n\n<read-files>\na.ts\n</read-files>\n\n<modified-files>\nb.ts\n</modified-files>`,
+    'the user messages before the kept entry follow the summary, before the file lists');
+  assert.deepEqual(result.compaction.details.selfCompact.ledger, { messages: 1, characters: 2000 });
   assert.equal(result.compaction.firstKeptEntryId, 'u2');
   assert.equal(result.compaction.details.selfCompact.summary, 'cache-shared');
   assert.equal(result.compaction.details.selfCompact.cacheRead, 150_000);
 });
 
-test('Pi writes its own summary on overflow, without a snapshot, and when the cached request fails', async t => {
+test('without a model registry or when every summarizer fails, Pi keeps its own compaction path', async t => {
   const cwd = await mkdtemp(join(tmpdir(), 'pi-sc-fallback-'));
   t.after(() => rm(cwd, { recursive: true, force: true }));
   const h = host(cwd);
@@ -133,7 +137,7 @@ test('Pi writes its own summary on overflow, without a snapshot, and when the ca
   assert.deepEqual(await h.emit('session_before_compact', { reason: 'overflow', preparation: preparation(), signal }), [undefined]);
   h.ctx.modelRegistry = { streamSimple: () => ({ result: async () => { throw new Error('provider down'); } }) };
   assert.deepEqual(await h.emit('session_before_compact', { reason: 'threshold', preparation: preparation(), signal }), [undefined]);
-  assert.match(h.notices.join('\n'), /Pi writes its own \(provider down\)/);
+  assert.match(h.notices.join('\n'), /Pi's summarizer writes it \(provider down\)/);
   await h.emit('session_compact', {});
   assert.deepEqual(await h.emit('session_before_compact', { reason: 'manual', preparation: preparation(), signal }), [undefined], 'a compaction drops the snapshot');
 });
