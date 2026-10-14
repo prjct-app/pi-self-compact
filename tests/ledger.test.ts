@@ -23,6 +23,7 @@ test('collects every user message before the first kept entry, text only, long o
     user('u2', [{ type: 'text', text: 'log:' }, { type: 'image', data: 'x' }, { type: 'text', text: 'e'.repeat(3_000) }]),
     { type: 'custom_message', id: 'c1', timestamp: '2026-10-14T09:32:00.000Z', content: 'team message' },
     user('u3', 'kept verbatim in the context'),
+    user('u3b', '<skill name="agent-tickets">long skill text</skill>'),
   ];
   const items = collectLedger(branch, 'u3');
   assert.deepEqual(items.map(item => item.entryId), ['u1', 'u2'], 'kept messages and non-user entries are excluded');

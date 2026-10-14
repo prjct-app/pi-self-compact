@@ -39,7 +39,8 @@ export const collectLedger = (branch: readonly BranchEntry[], firstKeptEntryId: 
   return (cut < 0 ? branch : branch.slice(0, cut)).flatMap(entry => {
     if (entry.type !== 'message' || entry.message?.role !== 'user' || dropped.has(entry.id)) return [];
     const full = textOf(entry.message.content).trim();
-    if (!full) return [];
+    // An expanded skill is the skill's text, not the user's words; it stays loadable on its own.
+    if (!full || full.startsWith('<skill')) return [];
     const text = full.slice(0, LEDGER_MESSAGE_CHARS);
     return [{ entryId: entry.id, timestamp: entry.timestamp ?? '', text, truncatedChars: full.length - text.length }];
   });
