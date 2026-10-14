@@ -118,7 +118,9 @@ test('an automatic compaction gets the summary that extends the cached session r
   const ledger = `${LEDGER_HEADER}\n[${h.entries[0].timestamp.slice(0, 16).replace('T', ' ')} · u1] ${'x'.repeat(2000)} … [+198,000 chars; full text in session entry u1]`;
   assert.equal(result.compaction.summary, `SUMMARY\n\n${ledger}\n\n<read-files>\na.ts\n</read-files>\n\n<modified-files>\nb.ts\n</modified-files>`,
     'the user messages before the kept entry follow the summary, before the file lists');
-  assert.deepEqual(result.compaction.details.selfCompact.ledger, { messages: 1, characters: 2000 });
+  assert.deepEqual(result.compaction.details.selfCompact.ledger, { messages: 1, characters: 2000, selected: 'all', dropped: [] },
+    'no keep line from the summarizer: every candidate is carried');
+  assert.match(context.messages.at(-1).content[0].text, /- u1: x{300} …\n/u, 'the summarizer is shown the candidates by id');
   assert.equal(result.compaction.firstKeptEntryId, 'u2');
   assert.equal(result.compaction.details.selfCompact.summary, 'cache-shared');
   assert.equal(result.compaction.details.selfCompact.cacheRead, 150_000);
