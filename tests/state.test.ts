@@ -120,3 +120,28 @@ test('the current request is carried only when the cut leaves it out', () => {
   assert.equal(currentRequest(branch, 'u1', users), '', 'already in the kept history');
   assert.equal(currentRequest([assistant('a1', 'x')], 'a1', new Map()), '');
 });
+
+test('a background update cut short by the end of the session neither saves nor crashes Pi', async () => {
+  const h = host(() => '[{"op":"add","kind":"rule","text":"no deploy without approval","source":"u1"}]');
+  const release: { answer?: () => void } = {};
+  const original = h.ctx.modelRegistry.streamSimple;
+  h.ctx.modelRegistry.streamSimple = (model: unknown, context: unknown, options: unknown) => {
+    const stream = original(model, context, options);
+    return { result: () => new Promise(resolve => { release.answer = () => resolve(stream.result()); }) };
+  };
+  const unhandled: unknown[] = [];
+  const track = (error: unknown) => unhandled.push(error);
+  process.on('unhandledRejection', track);
+  try {
+    await h.emit('agent_end', {});
+    await settle();
+    assert.ok(release.answer, 'the update is waiting on the model');
+    await h.emit('session_shutdown', {});
+    // From here on Pi rejects every use of the old ctx, the way a replaced or finished session does.
+    for (const key of ['hasUI', 'ui', 'sessionManager', 'model']) Object.defineProperty(h.ctx, key, { get() { throw new Error('This extension ctx is stale'); } });
+    release.answer!();
+    await settle();
+    assert.equal(h.entries.some(entry => entry.customType === STATE_ENTRY), false, 'nothing is written to the ended session');
+    assert.deepEqual(unhandled, []);
+  } finally { process.off('unhandledRejection', track); }
+});
