@@ -45,12 +45,18 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
     calibration: EMPTY_CALIBRATION as Calibration,
     calibrating: false,
     proposing: false,
+    /** Signal for the background updates started after runs; session_shutdown aborts them, since their ctx dies with the session. */
+    background: undefined as AbortController | undefined,
   };
   const reset = (): void => { R.snapshot = undefined; };
   const notify = (ctx: ExtensionContext, message: string): void => {
-    if (R.warned || !ctx.hasUI) return;
-    R.warned = true;
-    try { ctx.ui.notify(message, 'warning'); } catch { /* UI only. */ }
+    if (R.warned) return;
+    // A stale ctx (after /new, /reload or the end of a print run) throws on every property, hasUI included.
+    try {
+      if (!ctx.hasUI) return;
+      R.warned = true;
+      ctx.ui.notify(message, 'warning');
+    } catch { /* UI only. */ }
   };
 
   pi.on('session_start', async () => {
@@ -65,6 +71,7 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
     }, options.calibrationDelayMs ?? 5_000).unref?.();
   });
   pi.on('session_tree', async () => { reset(); R.state = undefined; });
+  pi.on('session_shutdown', async () => { R.background?.abort(); R.background = undefined; });
   pi.on('session_compact', async () => reset());
 
   // Runs after every `context` handler, so the snapshot matches the request byte for byte.
@@ -134,6 +141,8 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
       ? applyOps(folded, parseOps((await ask(reviewTask(folded, users))).text), at, users, true)
       : folded;
     const next: ProjectState = { ...reviewed, through: span.at(-1)!.id };
+    // The session ended while the model answered: its journal is closed to this update.
+    if (signal?.aborted) throw new Error('session ended before the project state was saved');
     pi.appendEntry(STATE_ENTRY, next);
     R.state = next;
     return next;
@@ -152,7 +161,10 @@ export const installSelfCompact = (pi: ExtensionAPI, options: SelfCompactOptions
     const span = unfolded(branch, R.state ?? restoreState(branch));
     const asked = span.some(entry => entry.type === 'message' && entry.message?.role === 'user');
     if (!asked && transcripts(span).join('').length < FOLD_AFTER_CHARS) return;
-    void queueUpdate(ctx).catch(error => notify(ctx, `self-compact: project state not updated (${error instanceof Error ? error.message : String(error)})`));
+    const background = (R.background ??= new AbortController());
+    void queueUpdate(ctx, background.signal).catch(error => {
+      if (!background.signal.aborted) notify(ctx, `self-compact: project state not updated (${error instanceof Error ? error.message : String(error)})`);
+    });
   });
 
   /**
